@@ -40,6 +40,7 @@ let debugForced = false;
 /** ===== 텔레그램 알림 ===== */
 const TG_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
+
 async function notify(msg: string) {
   // 텔레그램 미설정이면 콘솔에만 출력
   if (!TG_TOKEN || !TG_CHAT) {
@@ -47,13 +48,20 @@ async function notify(msg: string) {
     return;
   }
   try {
-    // Node 18+ global fetch 사용. 타입 경고 무시
+    // Node 18+ global fetch
     // @ts-ignore
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TG_CHAT, text: msg }),
-    });
+    const res = await fetch(
+      `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: TG_CHAT, text: msg }),
+      }
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      console.error("[TELEGRAM FAIL]", res.status, text);
+    }
   } catch (e: any) {
     console.error("[TELEGRAM ERROR]", e.message);
   }
@@ -251,7 +259,7 @@ async function placeLimitBuyKRW(
   const price = Number(upbit.priceToPrecision(SYMBOL_CCXT, targetPx));
 
   if (KILL_SWITCH || MODE !== "live") {
-    console.log(`[DRY] LIMIT BUY ${amount} @ ${price}`);
+    console.log(`[DRY] 지정가 매수(모의) ${amount} @ ${price}`);
     return { filled: amount, avg: price, orderId: "dry" };
   }
 
@@ -290,7 +298,7 @@ async function placeMarketSell(amount: number) {
 
   if (KILL_SWITCH || MODE !== "live") {
     const px = await lastPriceREST();
-    console.log(`[DRY] MARKET SELL ${amt} ~ ${px}`);
+    console.log(`[DRY] 시장가 매도(모의) ${amt} ~ ${px}`);
     return { sold: amt, avg: px, orderId: "dry" };
   }
   const od = await withRetry(
@@ -333,7 +341,7 @@ async function connectWS() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   const backoff = Math.min(2 ** wsReconnectAttempt, MAX_BACKOFF_SEC);
   if (wsReconnectAttempt > 0) {
-    console.log(`[WS] reconnect in ${backoff}s`);
+    console.log(`[WS] 재연결 대기 ${backoff}s`);
     await sleep(backoff * 1000);
   }
   ws = new WebSocket(WS_URL);
@@ -433,17 +441,31 @@ async function safeEntryTick() {
     entryRunning = false;
   }
 }
+function reasonKR(key: string) {
+  switch (key) {
+    case "MAX_TRADES":
+      return "일일 거래수 제한";
+    case "CONSEC_LOSSES":
+      return "연속 손실 제한";
+    case "DAILY_DD":
+      return "일 손실 한도 초과";
+    case "QUIET_HOURS":
+      return "조용한 시간대(신규 진입 차단)";
+    default:
+      return key;
+  }
+}
 async function entryTick() {
   const state = loadState();
   resetIfNewDay(state);
 
-  const hb = `cap=${Math.round(state.capitalKRW)}KRW dPnL=${Math.round(
+  const hb = `자본=${Math.round(state.capitalKRW)}원 | 일손익=${Math.round(
     state.dailyPnlKRW
-  )} trades=${state.dailyTrades} consec=${
+  )}원 | 거래수=${state.dailyTrades} | 연속손실=${
     state.consecutiveLosses
-  } mode=${MODE} kill=${KILL_SWITCH}`;
+  } | 모드=${MODE} | 킬스위치=${KILL_SWITCH}`;
   console.log(`[HB ${nowKST()}] ${hb}`);
-  await notify(`📊 HB ${nowKST()}\n${hb}`);
+  await notify(`📊 상태 보고 (${nowKST()})\n${hb}`);
 
   if (state.open) {
     saveState(state);
@@ -452,9 +474,9 @@ async function entryTick() {
 
   const block = riskBlocked(state);
   if (block) {
-    const msg = `[BLOCK] ${block}`;
+    const msg = `⛔ 진입 차단: ${reasonKR(block)}`;
     console.log(msg);
-    await notify(`⛔ ${msg}`);
+    await notify(msg);
     return;
   }
 
@@ -462,11 +484,14 @@ async function entryTick() {
   const up = regimeUp(closes);
   const sigRaw = up && breakout(closes, 20);
   const last = closes.at(-1)!;
-  const sigMsg = `[SIG] up=${up} breakout=${sigRaw} lastClose=${Math.round(
-    last
-  )} ts=${lastCandleTs}`;
+  const when = new Date(lastCandleTs).toLocaleString("ko-KR", {
+    timeZone: "Asia/Seoul",
+  });
+  const sigMsg = `🕒 캔들 마감 신호\n상승장=${up ? "예" : "아니오"} | 돌파=${
+    sigRaw ? "예" : "아니오"
+  }\n종가=${Math.round(last)}원 | 시각=${when}`;
   console.log(sigMsg);
-  await notify(`🕒 Candle Close\n${sigMsg}`);
+  await notify(sigMsg);
 
   let sig = sigRaw;
   if (!sigRaw && DEBUG_FORCE_ENTRY && !debugForced) {
@@ -487,9 +512,9 @@ async function entryTick() {
     Math.min(krw * POS_PCT, krw * 0.95)
   );
   if (sizeKRW < LIVE_MIN_ORDER_KRW) {
-    const m = `[ENTER] not enough KRW (${Math.round(krw)})`;
+    const m = `⚠️ KRW 잔고 부족 (보유: ${Math.round(krw)}원)`;
     console.log(m);
-    await notify(`⚠️ ${m}`);
+    await notify(m);
     return;
   }
 
@@ -510,9 +535,9 @@ async function entryTick() {
     console.log(`[PAPER] LIMIT BUY filled=${filled} @ ${avg}`);
   }
   if (filled <= 0) {
-    const m = "[ENTER] no fill";
+    const m = "⚠️ 매수 미체결 (타임아웃 취소됨)";
     console.log(m);
-    await notify(`⚠️ ${m}`);
+    await notify(m);
     return;
   }
 
@@ -537,7 +562,7 @@ async function entryTick() {
   });
   saveState(state);
 
-  const em = `🚀 ENTER\nentry=${Math.round(avg)}\namount=${filled}`;
+  const em = `🚀 매수 체결\n진입가=${Math.round(avg)}원\n수량=${filled}`;
   console.log(em);
   await notify(em);
 }
@@ -589,7 +614,7 @@ async function liveExitLoop() {
       });
       state.open = null;
       saveState(state);
-      const msg = `⛔ STOP EXIT\npnl=${Math.round(pnl)} KRW`;
+      const msg = `⛔ 손절 청산\n손익=${Math.round(pnl)}원`;
       console.log(msg);
       await notify(msg);
       return;
@@ -615,9 +640,9 @@ async function liveExitLoop() {
         notes: "ws",
       });
       saveState(state);
-      const msg = `✅ TP1 (+${(TP1 * 100).toFixed(2)}%)\npnl=${Math.round(
+      const msg = `✅ 1차 익절 (+${(TP1 * 100).toFixed(2)}%)\n손익=${Math.round(
         pnl
-      )} KRW`;
+      )}원`;
       console.log(msg);
       await notify(msg);
     }
@@ -642,9 +667,9 @@ async function liveExitLoop() {
         notes: "ws",
       });
       saveState(state);
-      const msg = `✅ TP2 (+${(TP2 * 100).toFixed(2)}%)\npnl=${Math.round(
+      const msg = `✅ 2차 익절 (+${(TP2 * 100).toFixed(2)}%)\n손익=${Math.round(
         pnl
-      )} KRW`;
+      )}원`;
       console.log(msg);
       await notify(msg);
     }
@@ -668,7 +693,7 @@ async function liveExitLoop() {
       });
       state.open = null;
       saveState(state);
-      const msg = `📉 TRAIL EXIT\npnl=${Math.round(pnl)} KRW`;
+      const msg = `📉 트레일링 청산\n손익=${Math.round(pnl)}원`;
       console.log(msg);
       await notify(msg);
       return;
@@ -689,7 +714,7 @@ async function liveExitLoop() {
   ensureCsv();
   setupShutdown();
   console.log(`Live trader started. MODE=${MODE}, KILL_SWITCH=${KILL_SWITCH}`);
-  await notify(`🟢 Bot Started\nMODE=${MODE} KILL_SWITCH=${KILL_SWITCH}`);
+  await notify(`🟢 봇 시작\nMODE=${MODE} | KILL_SWITCH=${KILL_SWITCH}`);
   // 1) 캔들 마감 +7s 마다 엔트리
   scheduleOnQuarter(7000);
   // 2) WS 가격
