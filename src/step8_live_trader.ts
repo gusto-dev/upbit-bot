@@ -17,23 +17,31 @@ const LOOKBACK = 400;
 const MODE = (process.env.MODE ?? "paper") as "paper" | "live";
 const BASE_CAPITAL = Number(process.env.BASE_CAPITAL_KRW ?? 1_000_000);
 const POS_PCT = Number(process.env.POS_PCT ?? 0.3);
+
+// 손익/익절/트레일
 const STOP = Number(process.env.STOP_LOSS ?? -0.01);
 const TP1 = Number(process.env.TP1 ?? 0.015);
 const TP2 = Number(process.env.TP2 ?? 0.025);
 const TRAIL = Number(process.env.TRAIL ?? -0.015);
+
+// 거래수 제한 및 시간대 제한
 const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY ?? 3);
-
-const LIVE_MIN_ORDER_KRW = Number(process.env.LIVE_MIN_ORDER_KRW ?? 5000);
-const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 5); // 0.05%
-const ENTRY_TIMEOUT_SEC = Number(process.env.ENTRY_TIMEOUT_SEC ?? 25);
-const RETRY_MAX = Number(process.env.RETRY_MAX ?? 2);
-
-const KILL_SWITCH = (process.env.KILL_SWITCH ?? "false") === "true";
 const QUIET_HOURS = {
   start: Number(process.env.QUIET_HOUR_START ?? 2),
   end: Number(process.env.QUIET_HOUR_END ?? 6),
 };
 
+// 진입 체결 관련
+const LIVE_MIN_ORDER_KRW = Number(process.env.LIVE_MIN_ORDER_KRW ?? 5000);
+const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 20); // 기본 0.20%
+const ENTRY_TIMEOUT_SEC = Number(process.env.ENTRY_TIMEOUT_SEC ?? 45);
+const RETRY_MAX = Number(process.env.RETRY_MAX ?? 2);
+
+// 시그널 파라미터
+const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 12); // 기본 12봉 돌파
+
+// 안전 스위치/디버그
+const KILL_SWITCH = (process.env.KILL_SWITCH ?? "false") === "true";
 const DEBUG_FORCE_ENTRY = (process.env.DEBUG_FORCE_ENTRY ?? "false") === "true";
 let debugForced = false;
 
@@ -42,7 +50,6 @@ const TG_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || "";
 
 async function notify(msg: string) {
-  // 텔레그램 미설정이면 콘솔에만 출력
   if (!TG_TOKEN || !TG_CHAT) {
     console.log("[NO-TELEGRAM]", msg);
     return;
@@ -75,9 +82,17 @@ const upbit = new ccxt.upbit({
   secret: process.env.UPBIT_SECRET,
   enableRateLimit: true,
 });
+
+// KST 기준 'YYYY-MM-DD'
+const todayKey = () => {
+  const kst = new Date().toLocaleString("en-CA", {
+    timeZone: "Asia/Seoul",
+    hour12: false,
+  });
+  return kst.slice(0, 10);
+};
 const nowKST = () =>
   new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
-const todayKey = () => new Date().toISOString().slice(0, 10);
 const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
 type OpenPos = {
@@ -191,12 +206,15 @@ async function lastPriceREST(): Promise<number> {
   const t = await upbit.fetchTicker(SYMBOL_CCXT);
   return t.last!;
 }
+
+// 레짐 필터(완화: 종가 > EMA200)
 function regimeUp(closes: number[]) {
   const e200 = EMA.calculate({ period: 200, values: closes }).at(-1);
   const last = closes.at(-1)!;
   return !!(e200 && last > e200);
 }
-function breakout(closes: number[], lookback = 20) {
+
+function breakout(closes: number[], lookback = BREAKOUT_LOOKBACK) {
   if (closes.length < lookback + 1) return false;
   const priorHigh = Math.max(...closes.slice(-lookback - 1, -1));
   const last = closes.at(-1)!;
@@ -219,8 +237,12 @@ function riskBlocked(s: State): string | null {
   if (s.dailyTrades >= MAX_TRADES_PER_DAY) return "MAX_TRADES";
   if (s.consecutiveLosses >= 2) return "CONSEC_LOSSES";
   if (s.dailyPnlKRW <= -0.03 * s.capitalKRW) return "DAILY_DD";
-  const h = new Date().getHours();
-  if (h >= QUIET_HOURS.start && h < QUIET_HOURS.end) return "QUIET_HOURS";
+  const h = new Date()
+    .toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false })
+    .split(" ")[1]
+    ?.split(":")[0];
+  const hour = h ? Number(h) : new Date().getHours();
+  if (hour >= QUIET_HOURS.start && hour < QUIET_HOURS.end) return "QUIET_HOURS";
   return null;
 }
 function estimatePnl(entry: number, exit: number, amount: number) {
@@ -305,7 +327,6 @@ async function placeMarketSell(amount: number) {
     () => upbit.createOrder(SYMBOL_CCXT, "market", "sell", amt),
     "marketSell"
   );
-  // 평균가 갱신
   let avg = od.average ?? 0;
   try {
     const od2 = await withRetry(
@@ -410,6 +431,7 @@ function setupShutdown() {
  *  캔들 마감 스케줄링 (진입 전용)
  *  ========================= */
 function scheduleOnQuarter(delayMs = 12000) {
+  // ← 마감 확정 대기 12초
   const now = new Date();
   const mins = now.getMinutes();
   const secs = now.getSeconds();
@@ -455,6 +477,7 @@ function reasonKR(key: string) {
       return key;
   }
 }
+
 async function entryTick() {
   const state = loadState();
   resetIfNewDay(state);
@@ -467,12 +490,17 @@ async function entryTick() {
   console.log(`[HB ${nowKST()}] ${hb}`);
   await notify(`📊 상태 보고 (${nowKST()})\n${hb}`);
 
-  if (state.open) {
-    saveState(state);
+  // ★ 실계좌와 상태 동기화 (유령 포지션 제거)
+  await reconcileStateWithBalance();
+
+  // 파일상 포지션 열려 있으면 신규 진입 스킵
+  const fresh = loadState();
+  if (fresh.open) {
+    saveState(fresh);
     return;
   }
 
-  const block = riskBlocked(state);
+  const block = riskBlocked(fresh);
   if (block) {
     const msg = `⛔ 진입 차단: ${reasonKR(block)}`;
     console.log(msg);
@@ -482,15 +510,16 @@ async function entryTick() {
 
   const { closes, lastCandleTs } = await fetchCloses(LOOKBACK);
   const up = regimeUp(closes);
-  const sigRaw =
-    up && breakout(closes, Number(process.env.BREAKOUT_LOOKBACK ?? 12));
+  const sigRaw = up && breakout(closes, BREAKOUT_LOOKBACK);
   const last = closes.at(-1)!;
   const when = new Date(lastCandleTs).toLocaleString("ko-KR", {
     timeZone: "Asia/Seoul",
   });
-  const sigMsg = `🕒 캔들 마감 신호\n상승장=${up ? "예" : "아니오"} | 돌파=${
-    sigRaw ? "예" : "아니오"
-  }\n종가=${Math.round(last)}원 | 시각=${when}`;
+  const sigMsg = `🕒 캔들 마감 신호\n상승장=${
+    up ? "예" : "아니오"
+  } | 돌파(${BREAKOUT_LOOKBACK})=${sigRaw ? "예" : "아니오"}\n종가=${Math.round(
+    last
+  )}원 | 시각=${when}`;
   console.log(sigMsg);
   await notify(sigMsg);
 
@@ -502,7 +531,7 @@ async function entryTick() {
   }
   if (!sig) return;
 
-  // 잔고
+  // 잔고 (live면 실제 계좌)
   let krw = BASE_CAPITAL;
   try {
     const bal = await upbit.fetchBalance();
@@ -543,14 +572,14 @@ async function entryTick() {
   }
 
   // 포지션 등록
-  state.open = {
+  fresh.open = {
     entry: avg,
     amount: filled,
     peak: avg,
     tp1Done: false,
     tp2Done: false,
   };
-  state.dailyTrades += 1;
+  fresh.dailyTrades += 1;
   appendCsv({
     datetime_kst: nowKST(),
     side: MODE === "live" ? "BUY(live)" : "BUY(paper)",
@@ -561,11 +590,32 @@ async function entryTick() {
     reason: "enter",
     notes: MODE,
   });
-  saveState(state);
+  saveState(fresh);
 
   const em = `🚀 매수 체결\n진입가=${Math.round(avg)}원\n수량=${filled}`;
   console.log(em);
   await notify(em);
+}
+
+/** =========================
+ *  실계좌와 상태 동기화 (유령 포지션 자동 정리)
+ *  ========================= */
+async function reconcileStateWithBalance() {
+  const state = loadState();
+  try {
+    const bal = await upbit.fetchBalance();
+    const btc = bal.total?.BTC ?? 0;
+    if (MODE === "live" && state.open && btc < 0.0000001) {
+      state.open = null;
+      saveState(state);
+      console.log("[RECONCILE] live 모드: 실계좌 BTC=0 → 열린 포지션 초기화");
+      await notify(
+        "🔄 상태 동기화: 실계좌 BTC 보유=0 → 열린 포지션을 초기화했습니다."
+      );
+    }
+  } catch (e: any) {
+    console.warn("[RECONCILE ERROR]", e.message);
+  }
 }
 
 /** =========================
@@ -716,12 +766,18 @@ async function liveExitLoop() {
   setupShutdown();
   console.log(`Live trader started. MODE=${MODE}, KILL_SWITCH=${KILL_SWITCH}`);
   await notify(`🟢 봇 시작\nMODE=${MODE} | KILL_SWITCH=${KILL_SWITCH}`);
-  // 1) 캔들 마감 +7s 마다 엔트리
+
+  // 시작 시 1회: 실계좌와 상태 동기화
+  await reconcileStateWithBalance();
+
+  // 마감 확정 지연 12초로 신호 평가
   scheduleOnQuarter(12000);
-  // 2) WS 가격
+
+  // WS 가격/핑/하트비트
   connectWS().catch(console.error);
   startWSHeartbeat();
   startWSPing();
-  // 3) 실시간 청산 루프(초당 1회)
+
+  // 초당 실시간 청산
   setInterval(liveExitLoop, 1000);
 })();
