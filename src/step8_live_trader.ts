@@ -192,9 +192,9 @@ async function lastPriceREST(): Promise<number> {
   return t.last!;
 }
 function regimeUp(closes: number[]) {
-  const e50 = EMA.calculate({ period: 50, values: closes }).at(-1);
   const e200 = EMA.calculate({ period: 200, values: closes }).at(-1);
-  return !!(e50 && e200 && e50 > e200);
+  const last = closes.at(-1)!;
+  return !!(e200 && last > e200);
 }
 function breakout(closes: number[], lookback = 20) {
   if (closes.length < lookback + 1) return false;
@@ -409,7 +409,7 @@ function setupShutdown() {
 /** =========================
  *  캔들 마감 스케줄링 (진입 전용)
  *  ========================= */
-function scheduleOnQuarter(delayMs = 7000) {
+function scheduleOnQuarter(delayMs = 12000) {
   const now = new Date();
   const mins = now.getMinutes();
   const secs = now.getSeconds();
@@ -482,7 +482,8 @@ async function entryTick() {
 
   const { closes, lastCandleTs } = await fetchCloses(LOOKBACK);
   const up = regimeUp(closes);
-  const sigRaw = up && breakout(closes, 20);
+  const sigRaw =
+    up && breakout(closes, Number(process.env.BREAKOUT_LOOKBACK ?? 12));
   const last = closes.at(-1)!;
   const when = new Date(lastCandleTs).toLocaleString("ko-KR", {
     timeZone: "Asia/Seoul",
@@ -716,7 +717,7 @@ async function liveExitLoop() {
   console.log(`Live trader started. MODE=${MODE}, KILL_SWITCH=${KILL_SWITCH}`);
   await notify(`🟢 봇 시작\nMODE=${MODE} | KILL_SWITCH=${KILL_SWITCH}`);
   // 1) 캔들 마감 +7s 마다 엔트리
-  scheduleOnQuarter(7000);
+  scheduleOnQuarter(12000);
   // 2) WS 가격
   connectWS().catch(console.error);
   startWSHeartbeat();
