@@ -1,0 +1,31 @@
+{
+  "name": "upbit-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "tsx src/step8_live_trader.ts",
+    "dev:ws": "tsx src/step5_ws.ts",
+    "test:notify": "tsx src/test_notify.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "ccxt": "^4.5.5",
+    "dotenv": "^17.2.2",
+    "node-fetch": "^3.3.2",
+    "technicalindicators": "^3.1.0",
+    "uuid": "^13.0.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/node-fetch": "^2.6.13",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

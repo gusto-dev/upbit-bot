@@ -1,0 +1,6 @@
+.env
+
+paper_state.json
+paper_trades.csv
+
+node_modules/
