@@ -2,7 +2,6 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import ccxt from "ccxt";
-import { EMA } from "technicalindicators";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
 
@@ -12,9 +11,9 @@ import { v4 as uuidv4 } from "uuid";
 const SYMBOL_CCXT = "BTC/KRW";
 const CODE_UPBIT = process.env.CODE_UPBIT || "KRW-BTC";
 
-// 옵션 B: 5분봉
-const TF = process.env.TF || "5m"; // 기본 5m
-const LOOKBACK = Number(process.env.LOOKBACK ?? 600); // 기본 600
+// 타임프레임: 기본 5분봉
+const TF = process.env.TF || "5m";
+const LOOKBACK = Number(process.env.LOOKBACK ?? 600);
 
 const MODE = (process.env.MODE ?? "paper") as "paper" | "live";
 const BASE_CAPITAL = Number(process.env.BASE_CAPITAL_KRW ?? 1_000_000);
@@ -33,14 +32,16 @@ const QUIET_HOURS = {
   end: Number(process.env.QUIET_HOUR_END ?? 6),
 };
 
-// 진입 체결 관련(체결률 개선 기본값)
+// 체결률 튜닝
 const LIVE_MIN_ORDER_KRW = Number(process.env.LIVE_MIN_ORDER_KRW ?? 5000);
-const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 20); // 0.20%
-const ENTRY_TIMEOUT_SEC = Number(process.env.ENTRY_TIMEOUT_SEC ?? 45);
+const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 25); // 0.25%
+const ENTRY_TIMEOUT_SEC = Number(process.env.ENTRY_TIMEOUT_SEC ?? 60);
 const RETRY_MAX = Number(process.env.RETRY_MAX ?? 2);
 
-// 옵션 A: 돌파 길이 완화
+// 돌파 완화 옵션
 const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 8);
+const BREAKOUT_TOL_BPS = Number(process.env.BREAKOUT_TOL_BPS ?? 10); // 0.10%
+const USE_HIGH_BREAKOUT = (process.env.USE_HIGH_BREAKOUT ?? "true") === "true";
 
 // 안전 스위치/디버그
 const KILL_SWITCH = (process.env.KILL_SWITCH ?? "false") === "true";
@@ -195,30 +196,36 @@ function appendCsv(row: Record<string, string | number>) {
 }
 
 /** =========================
- *  데이터/지표
+ *  데이터/지표 (고가 포함)
  *  ========================= */
 async function fetchCloses(limit = LOOKBACK) {
   const ohlcv = await upbit.fetchOHLCV(SYMBOL_CCXT, TF, undefined, limit);
   return {
     closes: ohlcv.map((c) => c[4]),
+    highs: ohlcv.map((c) => c[2]),
     lastCandleTs: ohlcv.at(-1)?.[0] ?? Date.now(),
   };
 }
-async function lastPriceREST(): Promise<number> {
-  const t = await upbit.fetchTicker(SYMBOL_CCXT);
-  return t.last!;
-}
 
-// 옵션 C: 레짐 필터 OFF (상승장 조건 해제)
-function regimeUp(_closes: number[]) {
-  return true;
-}
-
-function breakout(closes: number[], lookback = BREAKOUT_LOOKBACK) {
+// 돌파(종가, 허용오차 지원)
+function breakoutClose(
+  closes: number[],
+  lookback = BREAKOUT_LOOKBACK,
+  tolBps = BREAKOUT_TOL_BPS
+) {
   if (closes.length < lookback + 1) return false;
   const priorHigh = Math.max(...closes.slice(-lookback - 1, -1));
   const last = closes.at(-1)!;
-  return last > priorHigh;
+  const tol = priorHigh * (tolBps / 10000); // bps → 비율
+  return last >= priorHigh - tol;
+}
+
+// 돌파(고가, intrabar)
+function breakoutHigh(highs: number[], lookback = BREAKOUT_LOOKBACK) {
+  if (highs.length < lookback + 1) return false;
+  const priorHigh = Math.max(...highs.slice(-lookback - 1, -1));
+  const lastHigh = highs.at(-1)!;
+  return lastHigh > priorHigh;
 }
 
 /** =========================
@@ -266,6 +273,11 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
     }
   }
   throw lastErr;
+}
+
+async function lastPriceREST(): Promise<number> {
+  const t = await upbit.fetchTicker(SYMBOL_CCXT);
+  return t.last!;
 }
 
 async function placeLimitBuyKRW(
@@ -428,11 +440,11 @@ function setupShutdown() {
 }
 
 /** =========================
- *  5분봉 마감 감지 워처
+ *  5분봉 마감 감지 워처 (5초 주기)
  *  ========================= */
 let lastCandleKey = ""; // 마지막 처리한 캔들 키 (YYYY-MM-DD HH:MM)
 async function startQuarterWatcher() {
-  console.log("[SCHED] 5m/주기 마감 감시 시작(5초 주기)");
+  console.log("[SCHED] 5m 마감 감시 시작(5초 주기)");
   setInterval(async () => {
     try {
       const { lastCandleTs } = await fetchCloses(3); // 최신 3개면 충분
@@ -445,8 +457,7 @@ async function startQuarterWatcher() {
       if (key !== lastCandleKey) {
         lastCandleKey = key;
         console.log(`[SCHED] 새 캔들 감지(${TF}): ${key} → 신호 평가 실행`);
-        // 안정 지연(마감 데이터 확정 대기)
-        await sleep(8000); // 8초
+        await sleep(8000); // 마감 데이터 확정 대기
         await entryTick();
       }
     } catch (e: any) {
@@ -502,16 +513,29 @@ async function entryTick() {
     return;
   }
 
-  const { closes, lastCandleTs } = await fetchCloses(LOOKBACK);
-  const up = regimeUp(closes); // 항상 true (옵션 C)
-  const sigRaw = up && breakout(closes, BREAKOUT_LOOKBACK); // 사실상 breakout만 체크
+  const { closes, highs, lastCandleTs } = await fetchCloses(LOOKBACK);
+
+  // 레짐OFF: up은 항상 true
+  const up = true;
+
+  // 완화된 돌파: "종가 돌파(허용오차)" OR "고가 돌파" 중 하나라도 true면 진입
+  const brkClose = breakoutClose(closes, BREAKOUT_LOOKBACK, BREAKOUT_TOL_BPS);
+  const brkHigh = USE_HIGH_BREAKOUT
+    ? breakoutHigh(highs, BREAKOUT_LOOKBACK)
+    : false;
+
+  const sigRaw = up && (brkClose || brkHigh);
+
   const last = closes.at(-1)!;
   const when = new Date(lastCandleTs).toLocaleString("ko-KR", {
     timeZone: "Asia/Seoul",
   });
-  const sigMsg = `🕒 캔들 마감 신호\n(레짐OFF) 돌파(${BREAKOUT_LOOKBACK})=${
-    sigRaw ? "예" : "아니오"
-  }\n종가=${Math.round(last)}원 | 시각=${when} | TF=${TF}`;
+  const sigMsg =
+    `🕒 캔들 마감 신호\n` +
+    `(레짐OFF) 돌파(${BREAKOUT_LOOKBACK}) 종가=${
+      brkClose ? "예" : "아니오"
+    } | 고가=${brkHigh ? "예" : "아니오"} | tol=${BREAKOUT_TOL_BPS}bps\n` +
+    `종가=${Math.round(last)}원 | 시각=${when} | TF=${TF}`;
   console.log(sigMsg);
   await notify(sigMsg);
 
@@ -761,7 +785,7 @@ async function liveExitLoop() {
   // 시작 시 1회: 실계좌와 상태 동기화
   await reconcileStateWithBalance();
 
-  // 5분봉/주기 마감 감지 시작
+  // 5분봉 마감 감시 시작
   startQuarterWatcher();
 
   // WS 가격/핑/하트비트
