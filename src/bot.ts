@@ -116,6 +116,31 @@ const exchange = new ccxt.upbit({
   options: { adjustForTimeDifference: true },
 });
 
+// ---- Safe number helpers ----
+type Num = number | undefined | null;
+const asNum = (v: Num): number =>
+  typeof v === "number" && Number.isFinite(v) ? v : 0;
+
+// ccxt OHLCV: [timestamp, open, high, low, close, volume] with Num
+type OHLCVRow = [number, number, number, number, number, number];
+
+function normalizeOHLCV(rows: any[]): OHLCVRow[] {
+  // 강제로 number로 정규화 + 유효 close 필터
+  return rows
+    .map(
+      (r) =>
+        [
+          asNum(r[0]),
+          asNum(r[1]),
+          asNum(r[2]),
+          asNum(r[3]),
+          asNum(r[4]),
+          asNum(r[5]),
+        ] as OHLCVRow
+    )
+    .filter((r) => r[4] > 0); // close > 0만 사용
+}
+
 // -------------------- State --------------------
 type Pos = {
   entry: number;
@@ -163,27 +188,32 @@ function incTrade(symbol: string) {
 function ema(arr: number[], len: number) {
   return EMA.calculate({ values: arr, period: len });
 }
-function macdHist(arr: number[]) {
-  const res = MACD.calculate({
-    values: arr,
+function macdHist(values: number[]) {
+  const r = MACD.calculate({
+    values,
     fastPeriod: MACD_FAST,
     slowPeriod: MACD_SLOW,
     signalPeriod: MACD_SIGNAL,
     SimpleMAOscillator: false,
     SimpleMASignal: false,
   });
-  // align length; take last hist
-  return res.length ? res[res.length - 1].histogram ?? 0 : 0;
+  if (!r.length) return 0;
+  const last = r[r.length - 1];
+  const h =
+    last && typeof last.histogram === "number" ? (last.histogram as number) : 0;
+  return h;
 }
 
 function regimeOK(closes: number[]) {
   if (!USE_REGIME_FILTER) return true;
-  const efast = ema(closes, REGIME_EMA_FAST);
-  const eslow = ema(closes, REGIME_EMA_SLOW);
-  if (efast.length === 0 || eslow.length === 0) return false;
-  const lastFast = efast[efast.length - 1];
-  const lastSlow = eslow[eslow.length - 1];
-  if (lastFast <= lastSlow) return false;
+  const ef = ema(closes, REGIME_EMA_FAST);
+  const es = ema(closes, REGIME_EMA_SLOW);
+  if (!ef.length || !es.length) return false;
+
+  const lastFast = ef[ef.length - 1]!;
+  const lastSlow = es[es.length - 1]!;
+  if (!(lastFast > lastSlow)) return false;
+
   if (USE_MACD_CONFIRM) {
     const hist = macdHist(closes);
     if (!(hist > 0)) return false;
@@ -191,19 +221,20 @@ function regimeOK(closes: number[]) {
   return true;
 }
 
-function breakoutOK(ohlcv: number[][]) {
-  // ohlcv: [timestamp, open, high, low, close, volume]
+function breakoutOK(ohlcv: OHLCVRow[]) {
   const n = ohlcv.length;
   if (n < BREAKOUT_LOOKBACK + 2) return false;
-  const last = ohlcv[n - 1];
-  const closes = ohlcv.map((r) => r[4]);
-  const highs = ohlcv.map((r) => r[2]);
 
-  const priorHigh = Math.max(...highs.slice(n - 1 - BREAKOUT_LOOKBACK, n - 1));
-  const tol = priorHigh * (BREAKOUT_TOL_BPS / 10000); // bps
+  const highs = ohlcv.map((r) => r[2]);
+  const last = ohlcv[n - 1]!;
+  const priorSlice = highs.slice(n - 1 - BREAKOUT_LOOKBACK, n - 1);
+  if (!priorSlice.length) return false;
+
+  const priorHigh = Math.max(...priorSlice);
+  const tol = priorHigh * (BREAKOUT_TOL_BPS / 10000);
+
   const closeOK = last[4] >= priorHigh - tol;
   const highOK = USE_HIGH_BREAKOUT ? last[2] >= priorHigh - tol : false;
-
   return closeOK || highOK;
 }
 
@@ -250,14 +281,16 @@ async function loopSymbol(symbol: string) {
       resetDailyCountersIfNeeded();
 
       // candles
-      const ohlcv = await exchange.fetchOHLCV(symbol, TF, undefined, LOOKBACK);
+      const raw = await exchange.fetchOHLCV(symbol, TF, undefined, LOOKBACK);
+      const ohlcv = normalizeOHLCV(raw);
       if (!ohlcv.length) {
-        await sleep(LOOP_DELAY_MS);
+        await sleep(3000);
         continue;
       }
-      const last = ohlcv[ohlcv.length - 1];
-      const lastPx = last[4];
-      const closes = ohlcv.map((r) => r[4]);
+
+      const closes = ohlcv.map((r) => r[4]); // number[]
+      const last = ohlcv[ohlcv.length - 1]!;
+      const lastPx = last[4]; // number 보장
 
       const pos = positions.get(symbol);
 

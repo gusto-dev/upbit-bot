@@ -5,10 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "tsx src/bot.ts",
     "build": "tsc -p .",
-    "start": "node --enable-source-maps dist/bot.js"
+    "start": "node --enable-source-maps dist/bot.js",
+    "prestart": "npm run build"
   },
   "keywords": [],
   "author": "",
