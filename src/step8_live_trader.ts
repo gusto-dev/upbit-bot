@@ -43,6 +43,13 @@ const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 8);
 const BREAKOUT_TOL_BPS = Number(process.env.BREAKOUT_TOL_BPS ?? 10); // 0.10%
 const USE_HIGH_BREAKOUT = (process.env.USE_HIGH_BREAKOUT ?? "true") === "true";
 
+// 시장가 보충 진입(옵션)
+const USE_MARKET_FALLBACK =
+  (process.env.USE_MARKET_FALLBACK ?? "false") === "true";
+const MARKET_FALLBACK_MAX_BPS = Number(
+  process.env.MARKET_FALLBACK_MAX_BPS ?? 35
+); // 0.35% 이내만 보충
+
 // 안전 스위치/디버그
 const KILL_SWITCH = (process.env.KILL_SWITCH ?? "false") === "true";
 const DEBUG_FORCE_ENTRY = (process.env.DEBUG_FORCE_ENTRY ?? "false") === "true";
@@ -68,10 +75,7 @@ async function notify(msg: string) {
         body: JSON.stringify({ chat_id: TG_CHAT, text: msg }),
       }
     );
-    if (!res.ok) {
-      const text = await res.text();
-      console.error("[TELEGRAM FAIL]", res.status, text);
-    }
+    if (!res.ok) console.error("[TELEGRAM FAIL]", res.status, await res.text());
   } catch (e: any) {
     console.error("[TELEGRAM ERROR]", e.message);
   }
@@ -274,7 +278,6 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
   }
   throw lastErr;
 }
-
 async function lastPriceREST(): Promise<number> {
   const t = await upbit.fetchTicker(SYMBOL_CCXT);
   return t.last!;
@@ -323,6 +326,57 @@ async function placeLimitBuyKRW(
     } catch {}
   }
 
+  /** ----- 시장가 보충 진입 (옵션) ----- */
+  if (
+    USE_MARKET_FALLBACK &&
+    filled < amount &&
+    MODE === "live" &&
+    !KILL_SWITCH
+  ) {
+    try {
+      const pxNow2 = await withRetry(() => lastPriceREST(), "lastPrice2");
+      const worstOk = targetPx * (1 + MARKET_FALLBACK_MAX_BPS / 10000);
+      if (pxNow2 <= worstOk) {
+        const remain = amount - filled;
+        const remainKrw = remain * pxNow2; // 시장가 매수 금액
+        const od = await withRetry(
+          () =>
+            upbit.createOrder(
+              SYMBOL_CCXT,
+              "market",
+              "buy",
+              undefined,
+              undefined,
+              { cost: remainKrw }
+            ),
+          "marketBuyFallback"
+        );
+        let avg2 = od.average ?? pxNow2;
+        try {
+          const od2 = await withRetry(
+            () => upbit.fetchOrder(od.id!, SYMBOL_CCXT),
+            "fetchOrderAvg2"
+          );
+          avg2 = od2.average ?? avg2;
+        } catch {}
+        // 가중 평균가(지정가 체결분 + 시장가 보충분)
+        const filledBefore = filled;
+        filled = amount;
+        avg = (avg * filledBefore + avg2 * (amount - filledBefore)) / amount;
+        console.log(
+          `[FALLBACK] 시장가 보충 매수 성공 remain≈${(
+            amount - filledBefore
+          ).toFixed(8)} @ ~${Math.round(avg2)}`
+        );
+      } else {
+        console.warn("[FALLBACK SKIP] 가격이 안전캡 초과로 보충 생략");
+      }
+    } catch (e: any) {
+      console.warn("[FALLBACK FAIL] 시장가 보충 실패:", e.message);
+    }
+  }
+  /** ----------------------------------- */
+
   return { filled, avg: avg ?? price, orderId: id };
 }
 
@@ -353,15 +407,15 @@ async function placeMarketSell(amount: number) {
 /** =========================
  *  웹소켓 (실시간 청산)
  *  ========================= */
-let wsPrice = 0;
-let wsTs = 0;
+let wsPrice = 0,
+  wsTs = 0;
 let ws: WebSocket | null = null;
 let wsClosedByUser = false;
 let wsReconnectAttempt = 0;
 const WS_URL = "wss://api.upbit.com/websocket/v1";
-const HEARTBEAT_SEC = 5;
-const PING_SEC = 25;
-const MAX_BACKOFF_SEC = 30;
+const HEARTBEAT_SEC = 5,
+  PING_SEC = 25,
+  MAX_BACKOFF_SEC = 30;
 
 function wsPayload() {
   return JSON.stringify([
@@ -581,7 +635,7 @@ async function entryTick() {
     console.log(`[PAPER] LIMIT BUY filled=${filled} @ ${avg}`);
   }
   if (filled <= 0) {
-    const m = "⚠️ 매수 미체결 (타임아웃 취소됨)";
+    const m = "⚠️ 매수 미체결 (타임아웃/보충 실패)";
     console.log(m);
     await notify(m);
     return;
