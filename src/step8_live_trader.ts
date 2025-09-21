@@ -11,7 +11,7 @@ import { v4 as uuidv4 } from "uuid";
 const SYMBOL_CCXT = "BTC/KRW";
 const CODE_UPBIT = process.env.CODE_UPBIT || "KRW-BTC";
 
-// 타임프레임: 기본 5분봉
+// 타임프레임: 기본 5분봉(공격형)
 const TF = process.env.TF || "5m";
 const LOOKBACK = Number(process.env.LOOKBACK ?? 600);
 
@@ -20,13 +20,13 @@ const BASE_CAPITAL = Number(process.env.BASE_CAPITAL_KRW ?? 1_000_000);
 const POS_PCT = Number(process.env.POS_PCT ?? 0.3);
 
 // 손익/익절/트레일
-const STOP = Number(process.env.STOP_LOSS ?? -0.01);
-const TP1 = Number(process.env.TP1 ?? 0.015);
-const TP2 = Number(process.env.TP2 ?? 0.025);
+const STOP = Number(process.env.STOP_LOSS ?? -0.012); // 공격형은 손절 약간 넓힘 (-1.2%)
+const TP1 = Number(process.env.TP1 ?? 0.012); // TP1 +1.2%
+const TP2 = Number(process.env.TP2 ?? 0.022); // TP2 +2.2%
 const TRAIL = Number(process.env.TRAIL ?? -0.015);
 
 // 거래수 제한 및 시간대 제한
-const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY ?? 3);
+const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY ?? 4); // 공격형: 4회
 const QUIET_HOURS = {
   start: Number(process.env.QUIET_HOUR_START ?? 2),
   end: Number(process.env.QUIET_HOUR_END ?? 6),
@@ -34,21 +34,34 @@ const QUIET_HOURS = {
 
 // 체결률 튜닝
 const LIVE_MIN_ORDER_KRW = Number(process.env.LIVE_MIN_ORDER_KRW ?? 5000);
-const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 25); // 0.25%
+const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 30); // 0.30%
 const ENTRY_TIMEOUT_SEC = Number(process.env.ENTRY_TIMEOUT_SEC ?? 60);
 const RETRY_MAX = Number(process.env.RETRY_MAX ?? 2);
 
-// 돌파 완화 옵션
-const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 8);
-const BREAKOUT_TOL_BPS = Number(process.env.BREAKOUT_TOL_BPS ?? 10); // 0.10%
+// 돌파 완화 옵션(공격형: 더 느슨)
+const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 6); // 6봉
+const BREAKOUT_TOL_BPS = Number(process.env.BREAKOUT_TOL_BPS ?? 15); // 0.15%
 const USE_HIGH_BREAKOUT = (process.env.USE_HIGH_BREAKOUT ?? "true") === "true";
 
 // 시장가 보충 진입(옵션)
 const USE_MARKET_FALLBACK =
-  (process.env.USE_MARKET_FALLBACK ?? "false") === "true";
+  (process.env.USE_MARKET_FALLBACK ?? "true") === "true";
 const MARKET_FALLBACK_MAX_BPS = Number(
   process.env.MARKET_FALLBACK_MAX_BPS ?? 35
 ); // 0.35% 이내만 보충
+
+// 트렌드(레짐) 필터 (공격형 ON)
+const USE_REGIME_FILTER = (process.env.USE_REGIME_FILTER ?? "true") === "true";
+const REGIME_EMA_FAST = Number(process.env.REGIME_EMA_FAST ?? 20); // 5m EMA20
+const REGIME_EMA_SLOW = Number(process.env.REGIME_EMA_SLOW ?? 60); // 5m EMA60
+const USE_MACD_CONFIRM = (process.env.USE_MACD_CONFIRM ?? "false") === "true"; // 선택
+const MACD_FAST = Number(process.env.MACD_FAST ?? 12);
+const MACD_SLOW = Number(process.env.MACD_SLOW ?? 26);
+const MACD_SIGNAL = Number(process.env.MACD_SIGNAL ?? 9);
+
+// TP1 달성 후 BEP 이동(본전가로 손절 상향)
+const USE_BEP_AFTER_TP1 = (process.env.USE_BEP_AFTER_TP1 ?? "true") === "true";
+const BEP_OFFSET_BPS = Number(process.env.BEP_OFFSET_BPS ?? 0); // 본전가에서 몇 bps 아래(음수) 또는 위(양수)
 
 // 안전 스위치/디버그
 const KILL_SWITCH = (process.env.KILL_SWITCH ?? "false") === "true";
@@ -88,6 +101,8 @@ const upbit = new ccxt.upbit({
   apiKey: process.env.UPBIT_API_KEY,
   secret: process.env.UPBIT_SECRET,
   enableRateLimit: true,
+  timeout: 20000,
+  options: { adjustForTimeDifference: true },
 });
 
 // KST 기준 'YYYY-MM-DD'
@@ -108,6 +123,7 @@ type OpenPos = {
   peak: number;
   tp1Done: boolean;
   tp2Done: boolean;
+  bepped?: boolean; // BEP 이동 여부
 };
 type State = {
   day: string;
@@ -200,19 +216,68 @@ function appendCsv(row: Record<string, string | number>) {
 }
 
 /** =========================
+ *  간단 EMA / MACD (의존성 없이)
+ *  ========================= */
+function ema(values: number[], period: number) {
+  if (values.length < period) return [];
+  const k = 2 / (period + 1);
+  const out: number[] = [];
+  let emaPrev = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  out.push(emaPrev);
+  for (let i = period; i < values.length; i++) {
+    emaPrev = values[i] * k + emaPrev * (1 - k);
+    out.push(emaPrev);
+  }
+  return out;
+}
+function macdSeries(values: number[], fast = 12, slow = 26, signal = 9) {
+  if (values.length < slow + signal) return { macd: [], signal: [], hist: [] };
+  const emaFast = ema(values, fast);
+  const emaSlow = ema(values, slow);
+  // align lengths
+  const diffStart = Math.max(
+    values.length - emaFast.length,
+    values.length - emaSlow.length
+  );
+  const macd: number[] = [];
+  for (let i = 0; i < values.length - diffStart; i++) {
+    const idxFast = emaFast.length - (values.length - diffStart) + i;
+    const idxSlow = emaSlow.length - (values.length - diffStart) + i;
+    macd.push((emaFast[idxFast] ?? 0) - (emaSlow[idxSlow] ?? 0));
+  }
+  const signalArr = ema(macd, signal);
+  const hist: number[] = [];
+  const align = macd.length - signalArr.length;
+  for (let i = 0; i < signalArr.length; i++) {
+    hist.push(macd[i + align] - signalArr[i]);
+  }
+  return { macd, signal: signalArr, hist };
+}
+
+/** =========================
  *  데이터/지표 (닫힌 캔들 기준 + 고가 포함)
  *  ========================= */
 async function fetchCloses(limit = LOOKBACK) {
-  const ohlcv = await upbit.fetchOHLCV(SYMBOL_CCXT, TF, undefined, limit);
-  const last = ohlcv.at(-1); // 진행 중일 수 있음
-  const prev = ohlcv.at(-2); // "막 끝난" 닫힌 캔들
-
-  return {
-    closes: ohlcv.map((c) => c[4]),
-    highs: ohlcv.map((c) => c[2]),
-    lastCandleTs: last?.[0] ?? Date.now(), // 최신(진행 중 가능)
-    prevClosedTs: prev?.[0] ?? Date.now(), // 닫힌 캔들 타임스탬프
-  };
+  // 재시도 내장
+  let lastErr: any;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const ohlcv = await upbit.fetchOHLCV(SYMBOL_CCXT, TF, undefined, limit);
+      const last = ohlcv.at(-1); // 진행 중일 수 있음
+      const prev = ohlcv.at(-2); // "막 끝난" 닫힌 캔들
+      return {
+        closes: ohlcv.map((c) => c[4]),
+        highs: ohlcv.map((c) => c[2]),
+        lastCandleTs: last?.[0] ?? Date.now(),
+        prevClosedTs: prev?.[0] ?? Date.now(),
+      };
+    } catch (e: any) {
+      lastErr = e;
+      console.warn(`[FETCH OHLCV RETRY ${i + 1}/3] ${e.message}`);
+      await sleep(800 * (i + 1));
+    }
+  }
+  throw lastErr;
 }
 
 // 돌파(종가, 허용오차 지원)
@@ -234,6 +299,32 @@ function breakoutHigh(highs: number[], lookback = BREAKOUT_LOOKBACK) {
   const priorHigh = Math.max(...highs.slice(-lookback - 1, -1));
   const lastHigh = highs.at(-1)!;
   return lastHigh > priorHigh;
+}
+
+/** =========================
+ *  트렌드(레짐) 필터
+ *  ========================= */
+function regimeUpByEMA(
+  closes: number[],
+  fast = REGIME_EMA_FAST,
+  slow = REGIME_EMA_SLOW
+) {
+  if (closes.length < slow + 1) return false;
+  const eFast = ema(closes, fast);
+  const eSlow = ema(closes, slow);
+  const lastFast = eFast.at(-1)!;
+  const lastSlow = eSlow.at(-1)!;
+  return lastFast > lastSlow;
+}
+function macdUp(closes: number[]) {
+  const { hist } = macdSeries(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL);
+  return hist.at(-1)! > 0;
+}
+function regimeUp(closes: number[]) {
+  if (!USE_REGIME_FILTER) return true;
+  const emaOK = regimeUpByEMA(closes);
+  const macdOK = USE_MACD_CONFIRM ? macdUp(closes) : true;
+  return emaOK && macdOK;
 }
 
 /** =========================
@@ -292,6 +383,11 @@ async function placeLimitBuyKRW(
   timeoutSec: number,
   slippageBps: number
 ) {
+  console.log(
+    `[ENTRY] placing limit buy: sizeKRW=${Math.round(
+      sizeKRW
+    )} slip=${slippageBps}bps timeout=${timeoutSec}s`
+  );
   const pxNow = await withRetry(() => lastPriceREST(), "lastPrice");
   const targetPxRaw = pxNow * (1 + slippageBps / 10000);
   const targetPx = roundToTick(targetPxRaw);
@@ -309,6 +405,10 @@ async function placeLimitBuyKRW(
     "createOrder"
   );
   const id = order.id;
+  console.log(
+    `[ENTRY] created limit order id=${id} amount=${amount} price=${price}`
+  );
+
   const tEnd = Date.now() + timeoutSec * 1000;
   let filled = order.filled ?? 0;
   let avg = order.average ?? price;
@@ -576,8 +676,8 @@ async function entryTick() {
   const closesClosed = closes.slice(0, -1);
   const highsClosed = highs.slice(0, -1);
 
-  // 레짐OFF: up은 항상 true
-  const up = true;
+  // 트렌드 필터(공격형 ON)
+  const up = regimeUp(closesClosed);
 
   // 완화된 돌파: "종가 돌파(허용오차)" OR "고가 돌파" 중 하나라도 true면 진입
   const brkClose = breakoutClose(
@@ -597,7 +697,7 @@ async function entryTick() {
   });
   const sigMsg =
     `🕒 캔들 마감 신호(닫힌 캔들)\n` +
-    `(레짐OFF) 돌파(${BREAKOUT_LOOKBACK}) 종가=${
+    `상승장=${up ? "예" : "아니오"} | 돌파(${BREAKOUT_LOOKBACK}) 종가=${
       brkClose ? "예" : "아니오"
     } | 고가=${brkHigh ? "예" : "아니오"} | tol=${BREAKOUT_TOL_BPS}bps\n` +
     `종가=${Math.round(lastClose)}원 | 시각=${when} | TF=${TF}`;
@@ -630,6 +730,11 @@ async function entryTick() {
   }
 
   // 진입
+  console.log(
+    `[ENTRY TRY] sizeKRW=${Math.round(
+      sizeKRW
+    )} MODE=${MODE} KILL=${KILL_SWITCH}`
+  );
   let filled = 0,
     avg = lastClose;
   if (MODE === "live" && !KILL_SWITCH) {
@@ -658,6 +763,7 @@ async function entryTick() {
     peak: avg,
     tp1Done: false,
     tp2Done: false,
+    bepped: false,
   };
   fresh.dailyTrades += 1;
   appendCsv({
@@ -668,7 +774,7 @@ async function entryTick() {
     amount: filled,
     pnl_krw: 0,
     reason: "enter",
-    notes: MODE,
+    notes: `breakout=${brkClose || brkHigh}`,
   });
   saveState(fresh);
 
@@ -721,12 +827,19 @@ async function liveExitLoop() {
     const pos = state.open;
     pos.peak = Math.max(pos.peak, px);
 
-    const sl = pos.entry * (1 + STOP);
+    // BEP 라인 계산 (TP1 후 적용)
+    const bepLine = pos.entry * (1 + BEP_OFFSET_BPS / 10000);
+
+    // 기본 청산 레벨
+    const sl =
+      pos.bepped && USE_BEP_AFTER_TP1
+        ? Math.max(bepLine, pos.entry)
+        : pos.entry * (1 + STOP);
     const tp1 = pos.entry * (1 + TP1);
     const tp2 = pos.entry * (1 + TP2);
     const trailLine = pos.peak * (1 + TRAIL);
 
-    // 손절
+    // 손절 / BEP 손절
     if (px <= sl) {
       const { sold, avg } = await placeMarketSell(pos.amount);
       const pnl = estimatePnl(pos.entry, avg || px, sold);
@@ -740,12 +853,13 @@ async function liveExitLoop() {
         exit: avg || px,
         amount: sold,
         pnl_krw: Math.round(pnl),
-        reason: "stop",
-        notes: "ws",
+        reason: pos.bepped ? "bep_stop" : "stop",
+        notes: `peak=${Math.round(pos.peak)}`,
       });
       state.open = null;
       saveState(state);
-      const msg = `⛔ 손절 청산\n손익=${Math.round(pnl)}원`;
+      const tag = pos.bepped ? "🟰 BEP 청산" : "⛔ 손절 청산";
+      const msg = `${tag}\n손익=${Math.round(pnl)}원`;
       console.log(msg);
       await notify(msg);
       return;
@@ -758,6 +872,10 @@ async function liveExitLoop() {
       const pnl = estimatePnl(pos.entry, avg || px, sold);
       pos.amount -= sold;
       pos.tp1Done = true;
+
+      // TP1 달성 후 BEP 이동 활성화
+      if (USE_BEP_AFTER_TP1) pos.bepped = true;
+
       state.dailyPnlKRW += pnl;
       state.capitalKRW += pnl;
       appendCsv({
@@ -768,12 +886,12 @@ async function liveExitLoop() {
         amount: sold,
         pnl_krw: Math.round(pnl),
         reason: "tp1",
-        notes: "ws",
+        notes: `BEP=${pos.bepped}`,
       });
       saveState(state);
       const msg = `✅ 1차 익절 (+${(TP1 * 100).toFixed(2)}%)\n손익=${Math.round(
         pnl
-      )}원`;
+      )}원\nBEP 이동=${USE_BEP_AFTER_TP1 ? "예" : "아니오"}`;
       console.log(msg);
       await notify(msg);
     }
