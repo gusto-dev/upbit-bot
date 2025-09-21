@@ -200,14 +200,18 @@ function appendCsv(row: Record<string, string | number>) {
 }
 
 /** =========================
- *  데이터/지표 (고가 포함)
+ *  데이터/지표 (닫힌 캔들 기준 + 고가 포함)
  *  ========================= */
 async function fetchCloses(limit = LOOKBACK) {
   const ohlcv = await upbit.fetchOHLCV(SYMBOL_CCXT, TF, undefined, limit);
+  const last = ohlcv.at(-1); // 진행 중일 수 있음
+  const prev = ohlcv.at(-2); // "막 끝난" 닫힌 캔들
+
   return {
     closes: ohlcv.map((c) => c[4]),
     highs: ohlcv.map((c) => c[2]),
-    lastCandleTs: ohlcv.at(-1)?.[0] ?? Date.now(),
+    lastCandleTs: last?.[0] ?? Date.now(), // 최신(진행 중 가능)
+    prevClosedTs: prev?.[0] ?? Date.now(), // 닫힌 캔들 타임스탬프
   };
 }
 
@@ -359,7 +363,6 @@ async function placeLimitBuyKRW(
           );
           avg2 = od2.average ?? avg2;
         } catch {}
-        // 가중 평균가(지정가 체결분 + 시장가 보충분)
         const filledBefore = filled;
         filled = amount;
         avg = (avg * filledBefore + avg2 * (amount - filledBefore)) / amount;
@@ -494,24 +497,24 @@ function setupShutdown() {
 }
 
 /** =========================
- *  5분봉 마감 감지 워처 (5초 주기)
+ *  5분봉 마감 감지 워처 (닫힌 캔들 TS 사용, 5초 주기)
  *  ========================= */
 let lastCandleKey = ""; // 마지막 처리한 캔들 키 (YYYY-MM-DD HH:MM)
 async function startQuarterWatcher() {
-  console.log("[SCHED] 5m 마감 감시 시작(5초 주기)");
+  console.log("[SCHED] 5m 마감 감시 시작(5초 주기, 닫힌 캔들 기준)");
   setInterval(async () => {
     try {
-      const { lastCandleTs } = await fetchCloses(3); // 최신 3개면 충분
+      const { prevClosedTs } = await fetchCloses(3); // 닫힌 캔들 TS 확인
       // KST 기준으로 분 단위 키 생성
-      const kst = new Date(lastCandleTs).toLocaleString("en-CA", {
+      const kst = new Date(prevClosedTs).toLocaleString("en-CA", {
         timeZone: "Asia/Seoul",
         hour12: false,
       });
       const key = kst.slice(0, 16); // 'YYYY-MM-DD HH:MM'
       if (key !== lastCandleKey) {
         lastCandleKey = key;
-        console.log(`[SCHED] 새 캔들 감지(${TF}): ${key} → 신호 평가 실행`);
-        await sleep(8000); // 마감 데이터 확정 대기
+        console.log(`[SCHED] 닫힌 캔들 감지(${TF}): ${key} → 신호 평가 실행`);
+        await sleep(3000); // 닫힌 캔들이므로 3초면 충분
         await entryTick();
       }
     } catch (e: any) {
@@ -521,7 +524,7 @@ async function startQuarterWatcher() {
 }
 
 /** =========================
- *  엔트리 틱 (마감 직후만)
+ *  엔트리 틱 (닫힌 캔들 기반)
  *  ========================= */
 function reasonKR(key: string) {
   switch (key) {
@@ -567,29 +570,37 @@ async function entryTick() {
     return;
   }
 
-  const { closes, highs, lastCandleTs } = await fetchCloses(LOOKBACK);
+  const { closes, highs, prevClosedTs } = await fetchCloses(LOOKBACK + 1);
+
+  // 닫힌 캔들 배열(마지막 진행중 캔들 제거)
+  const closesClosed = closes.slice(0, -1);
+  const highsClosed = highs.slice(0, -1);
 
   // 레짐OFF: up은 항상 true
   const up = true;
 
   // 완화된 돌파: "종가 돌파(허용오차)" OR "고가 돌파" 중 하나라도 true면 진입
-  const brkClose = breakoutClose(closes, BREAKOUT_LOOKBACK, BREAKOUT_TOL_BPS);
+  const brkClose = breakoutClose(
+    closesClosed,
+    BREAKOUT_LOOKBACK,
+    BREAKOUT_TOL_BPS
+  );
   const brkHigh = USE_HIGH_BREAKOUT
-    ? breakoutHigh(highs, BREAKOUT_LOOKBACK)
+    ? breakoutHigh(highsClosed, BREAKOUT_LOOKBACK)
     : false;
 
   const sigRaw = up && (brkClose || brkHigh);
 
-  const last = closes.at(-1)!;
-  const when = new Date(lastCandleTs).toLocaleString("ko-KR", {
+  const lastClose = closesClosed.at(-1)!;
+  const when = new Date(prevClosedTs).toLocaleString("ko-KR", {
     timeZone: "Asia/Seoul",
   });
   const sigMsg =
-    `🕒 캔들 마감 신호\n` +
+    `🕒 캔들 마감 신호(닫힌 캔들)\n` +
     `(레짐OFF) 돌파(${BREAKOUT_LOOKBACK}) 종가=${
       brkClose ? "예" : "아니오"
     } | 고가=${brkHigh ? "예" : "아니오"} | tol=${BREAKOUT_TOL_BPS}bps\n` +
-    `종가=${Math.round(last)}원 | 시각=${when} | TF=${TF}`;
+    `종가=${Math.round(lastClose)}원 | 시각=${when} | TF=${TF}`;
   console.log(sigMsg);
   await notify(sigMsg);
 
@@ -620,7 +631,7 @@ async function entryTick() {
 
   // 진입
   let filled = 0,
-    avg = last;
+    avg = lastClose;
   if (MODE === "live" && !KILL_SWITCH) {
     const res = await placeLimitBuyKRW(
       sizeKRW,
@@ -630,8 +641,8 @@ async function entryTick() {
     filled = res.filled;
     avg = res.avg;
   } else {
-    filled = sizeKRW / last;
-    avg = last;
+    filled = sizeKRW / lastClose;
+    avg = lastClose;
     console.log(`[PAPER] LIMIT BUY filled=${filled} @ ${avg}`);
   }
   if (filled <= 0) {
@@ -839,7 +850,7 @@ async function liveExitLoop() {
   // 시작 시 1회: 실계좌와 상태 동기화
   await reconcileStateWithBalance();
 
-  // 5분봉 마감 감시 시작
+  // 5분봉 마감 감시 시작(닫힌 캔들 기준)
   startQuarterWatcher();
 
   // WS 가격/핑/하트비트
