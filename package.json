@@ -6,9 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/bot.ts",
-    "build": "tsc -p .",
-    "start": "node --enable-source-maps dist/bot.js",
-    "prestart": "npm run build"
+    "start": "tsx src/bot.ts"
   },
   "keywords": [],
   "author": "",
