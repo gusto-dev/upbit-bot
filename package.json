@@ -6,9 +6,9 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "tsx src/step8_live_trader.ts",
-    "dev:ws": "tsx src/step5_ws.ts",
-    "test:notify": "tsx src/test_notify.ts"
+    "dev": "tsx src/bot.ts",
+    "build": "tsc -p .",
+    "start": "node --enable-source-maps dist/bot.js"
   },
   "keywords": [],
   "author": "",
