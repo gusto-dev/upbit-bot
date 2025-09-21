@@ -11,8 +11,10 @@ import { v4 as uuidv4 } from "uuid";
  *  ========================= */
 const SYMBOL_CCXT = "BTC/KRW";
 const CODE_UPBIT = process.env.CODE_UPBIT || "KRW-BTC";
-const TF = "15m";
-const LOOKBACK = 400;
+
+// 옵션 B: 5분봉
+const TF = process.env.TF || "5m"; // 기본 5m
+const LOOKBACK = Number(process.env.LOOKBACK ?? 600); // 기본 600
 
 const MODE = (process.env.MODE ?? "paper") as "paper" | "live";
 const BASE_CAPITAL = Number(process.env.BASE_CAPITAL_KRW ?? 1_000_000);
@@ -31,14 +33,14 @@ const QUIET_HOURS = {
   end: Number(process.env.QUIET_HOUR_END ?? 6),
 };
 
-// 진입 체결 관련
+// 진입 체결 관련(체결률 개선 기본값)
 const LIVE_MIN_ORDER_KRW = Number(process.env.LIVE_MIN_ORDER_KRW ?? 5000);
-const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 20); // 기본 0.20%
+const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 20); // 0.20%
 const ENTRY_TIMEOUT_SEC = Number(process.env.ENTRY_TIMEOUT_SEC ?? 45);
 const RETRY_MAX = Number(process.env.RETRY_MAX ?? 2);
 
-// 시그널 파라미터
-const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 12); // 기본 12봉 돌파
+// 옵션 A: 돌파 길이 완화
+const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 8);
 
 // 안전 스위치/디버그
 const KILL_SWITCH = (process.env.KILL_SWITCH ?? "false") === "true";
@@ -138,7 +140,7 @@ function roundToTick(price: number) {
 /** =========================
  *  파일/상태
  *  ========================= */
-const STATE_FILE = path.resolve("paper_state.json"); // 상태 공유
+const STATE_FILE = path.resolve("paper_state.json");
 const CSV_FILE = path.resolve("paper_trades.csv");
 
 function fileExists(p: string) {
@@ -207,11 +209,9 @@ async function lastPriceREST(): Promise<number> {
   return t.last!;
 }
 
-// 레짐 필터(완화: 종가 > EMA200)
-function regimeUp(closes: number[]) {
-  const e200 = EMA.calculate({ period: 200, values: closes }).at(-1);
-  const last = closes.at(-1)!;
-  return !!(e200 && last > e200);
+// 옵션 C: 레짐 필터 OFF (상승장 조건 해제)
+function regimeUp(_closes: number[]) {
+  return true;
 }
 
 function breakout(closes: number[], lookback = BREAKOUT_LOOKBACK) {
@@ -237,11 +237,11 @@ function riskBlocked(s: State): string | null {
   if (s.dailyTrades >= MAX_TRADES_PER_DAY) return "MAX_TRADES";
   if (s.consecutiveLosses >= 2) return "CONSEC_LOSSES";
   if (s.dailyPnlKRW <= -0.03 * s.capitalKRW) return "DAILY_DD";
-  const h = new Date()
-    .toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false })
-    .split(" ")[1]
-    ?.split(":")[0];
-  const hour = h ? Number(h) : new Date().getHours();
+  const hour = Number(
+    new Date()
+      .toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false })
+      .slice(11, 13)
+  );
   if (hour >= QUIET_HOURS.start && hour < QUIET_HOURS.end) return "QUIET_HOURS";
   return null;
 }
@@ -428,41 +428,36 @@ function setupShutdown() {
 }
 
 /** =========================
- *  캔들 마감 스케줄링 (진입 전용)
+ *  5분봉 마감 감지 워처
  *  ========================= */
-function scheduleOnQuarter(delayMs = 12000) {
-  // ← 마감 확정 대기 12초
-  const now = new Date();
-  const mins = now.getMinutes();
-  const secs = now.getSeconds();
-  const ms = now.getMilliseconds();
-  const nextQ = Math.ceil((mins + 0.001) / 15) * 15;
-  const addMin = (nextQ % 60) - mins;
-  let wait = addMin * 60_000 - secs * 1_000 - ms + delayMs;
-  if (wait < 0) wait += 15 * 60_000;
-  setTimeout(() => {
-    safeEntryTick().finally(() => {
-      setInterval(() => safeEntryTick(), 15 * 60_000);
-    });
-  }, wait);
+let lastCandleKey = ""; // 마지막 처리한 캔들 키 (YYYY-MM-DD HH:MM)
+async function startQuarterWatcher() {
+  console.log("[SCHED] 5m/주기 마감 감시 시작(5초 주기)");
+  setInterval(async () => {
+    try {
+      const { lastCandleTs } = await fetchCloses(3); // 최신 3개면 충분
+      // KST 기준으로 분 단위 키 생성
+      const kst = new Date(lastCandleTs).toLocaleString("en-CA", {
+        timeZone: "Asia/Seoul",
+        hour12: false,
+      });
+      const key = kst.slice(0, 16); // 'YYYY-MM-DD HH:MM'
+      if (key !== lastCandleKey) {
+        lastCandleKey = key;
+        console.log(`[SCHED] 새 캔들 감지(${TF}): ${key} → 신호 평가 실행`);
+        // 안정 지연(마감 데이터 확정 대기)
+        await sleep(8000); // 8초
+        await entryTick();
+      }
+    } catch (e: any) {
+      console.warn("[SCHED ERROR]", e.message);
+    }
+  }, 5000);
 }
 
 /** =========================
  *  엔트리 틱 (마감 직후만)
  *  ========================= */
-let entryRunning = false;
-async function safeEntryTick() {
-  if (entryRunning) return;
-  entryRunning = true;
-  try {
-    await entryTick();
-  } catch (e: any) {
-    console.error("[ENTRY ERROR]", e.message);
-    await sleep(1500);
-  } finally {
-    entryRunning = false;
-  }
-}
 function reasonKR(key: string) {
   switch (key) {
     case "MAX_TRADES":
@@ -490,10 +485,9 @@ async function entryTick() {
   console.log(`[HB ${nowKST()}] ${hb}`);
   await notify(`📊 상태 보고 (${nowKST()})\n${hb}`);
 
-  // ★ 실계좌와 상태 동기화 (유령 포지션 제거)
+  // 실계좌와 상태 동기화(유령 포지션 정리)
   await reconcileStateWithBalance();
 
-  // 파일상 포지션 열려 있으면 신규 진입 스킵
   const fresh = loadState();
   if (fresh.open) {
     saveState(fresh);
@@ -509,17 +503,15 @@ async function entryTick() {
   }
 
   const { closes, lastCandleTs } = await fetchCloses(LOOKBACK);
-  const up = regimeUp(closes);
-  const sigRaw = up && breakout(closes, BREAKOUT_LOOKBACK);
+  const up = regimeUp(closes); // 항상 true (옵션 C)
+  const sigRaw = up && breakout(closes, BREAKOUT_LOOKBACK); // 사실상 breakout만 체크
   const last = closes.at(-1)!;
   const when = new Date(lastCandleTs).toLocaleString("ko-KR", {
     timeZone: "Asia/Seoul",
   });
-  const sigMsg = `🕒 캔들 마감 신호\n상승장=${
-    up ? "예" : "아니오"
-  } | 돌파(${BREAKOUT_LOOKBACK})=${sigRaw ? "예" : "아니오"}\n종가=${Math.round(
-    last
-  )}원 | 시각=${when}`;
+  const sigMsg = `🕒 캔들 마감 신호\n(레짐OFF) 돌파(${BREAKOUT_LOOKBACK})=${
+    sigRaw ? "예" : "아니오"
+  }\n종가=${Math.round(last)}원 | 시각=${when} | TF=${TF}`;
   console.log(sigMsg);
   await notify(sigMsg);
 
@@ -571,7 +563,6 @@ async function entryTick() {
     return;
   }
 
-  // 포지션 등록
   fresh.open = {
     entry: avg,
     amount: filled,
@@ -770,8 +761,8 @@ async function liveExitLoop() {
   // 시작 시 1회: 실계좌와 상태 동기화
   await reconcileStateWithBalance();
 
-  // 마감 확정 지연 12초로 신호 평가
-  scheduleOnQuarter(12000);
+  // 5분봉/주기 마감 감지 시작
+  startQuarterWatcher();
 
   // WS 가격/핑/하트비트
   connectWS().catch(console.error);
