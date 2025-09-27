@@ -1,17 +1,23 @@
 // src/bot.ts
-// Upbit multi-coin aggressive trader (single-file).
-// - Runs with: npm start  (package.json: "start": "tsx src/bot.ts")
-// - Uses WebSocket ticker guard, safe OHLCV normalization, regime & breakout filters,
-//   partial TP ladder (TP1/TP2), BEP after TP1, trailing stop, and daily/quiet guards.
-// - Upbit market BUY uses "cost" param via ccxt options (createMarketBuyOrderRequiresPrice: false).
+// Upbit multi-coin aggressive trader (single-file, TSX runtime).
+// - Start: npm start  (package.json: "start": "tsx src/bot.ts")
+// - Includes:
+//   * WebSocket ticker guard (Upbit)
+//   * Safe OHLCV normalization (ccxt Num -> number)
+//   * Entry filters: EMA(20>60) + breakout(lookback)
+//   * Market BUY by KRW cost (Upbit-specific via ccxt option)
+//   * Market SELL with precision/min-notional guard + retry-friendly logic
+//   * TP1/TP2 + BEP shift + trailing stop + hard stop
+//   * Clear Telegram reasons on SELL skip/failure/dust
+//   * Basic balance-vs-state mismatch warning on start
 
 import "dotenv/config";
 import ccxt from "ccxt";
 import WebSocket from "ws";
 import { EMA, MACD } from "technicalindicators";
 
-// ======================== ENV ========================
-const MODE = (process.env.MODE || "live").toLowerCase(); // "live" | "paper"
+// =============== ENV ===============
+const MODE = (process.env.MODE || "live").toLowerCase(); // live | paper
 const KILL_SWITCH =
   (process.env.KILL_SWITCH || "false").toLowerCase() === "true";
 
@@ -19,8 +25,7 @@ const TRADE_COINS = (process.env.TRADE_COINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
-const SYMBOL_CCXT = process.env.SYMBOL_CCXT || "BTC/KRW"; // fallback if TRADE_COINS empty
+const SYMBOL_CCXT = process.env.SYMBOL_CCXT || "BTC/KRW";
 
 const UPBIT_API_KEY = process.env.UPBIT_API_KEY || "";
 const UPBIT_SECRET = process.env.UPBIT_SECRET || "";
@@ -29,11 +34,10 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 const BASE_CAPITAL_KRW = num(process.env.BASE_CAPITAL_KRW, 500000);
-const POS_PCT = num(process.env.POS_PCT, 0.12); // 12% per entry
+const POS_PCT = num(process.env.POS_PCT, 0.12);
 const LIVE_MIN_ORDER_KRW = num(process.env.LIVE_MIN_ORDER_KRW, 5000);
 
-const ENTRY_SLIPPAGE_BPS = num(process.env.ENTRY_SLIPPAGE_BPS, 30); // 0.30% guard vs latest candle
-const ENTRY_TIMEOUT_SEC = num(process.env.ENTRY_TIMEOUT_SEC, 60); // (kept for future use)
+const ENTRY_SLIPPAGE_BPS = num(process.env.ENTRY_SLIPPAGE_BPS, 30); // 0.30%
 const RETRY_MAX = num(process.env.RETRY_MAX, 2);
 
 const BREAKOUT_LOOKBACK = num(process.env.BREAKOUT_LOOKBACK, 6);
@@ -48,9 +52,6 @@ const MACD_FAST = num(process.env.MACD_FAST, 12);
 const MACD_SLOW = num(process.env.MACD_SLOW, 26);
 const MACD_SIGNAL = num(process.env.MACD_SIGNAL, 9);
 
-const USE_MARKET_FALLBACK = bool(process.env.USE_MARKET_FALLBACK, true); // reserved
-const MARKET_FALLBACK_MAX_BPS = num(process.env.MARKET_FALLBACK_MAX_BPS, 35); // reserved
-
 const STOP_LOSS = num(process.env.STOP_LOSS, -0.012); // -1.2%
 const TP1 = num(process.env.TP1, 0.012); // +1.2%
 const TP2 = num(process.env.TP2, 0.022); // +2.2%
@@ -59,16 +60,16 @@ const USE_BEP_AFTER_TP1 = bool(process.env.USE_BEP_AFTER_TP1, true);
 const BEP_OFFSET_BPS = num(process.env.BEP_OFFSET_BPS, 0);
 
 const MAX_TRADES_PER_DAY = num(process.env.MAX_TRADES_PER_DAY, 4);
-const QUIET_HOUR_START = num(process.env.QUIET_HOUR_START, 2); // 02:00 KST
-const QUIET_HOUR_END = num(process.env.QUIET_HOUR_END, 6); // 06:00 KST
+const MAX_CONCURRENT_POSITIONS = num(process.env.MAX_CONCURRENT_POSITIONS, 3);
+const QUIET_HOUR_START = num(process.env.QUIET_HOUR_START, 2);
+const QUIET_HOUR_END = num(process.env.QUIET_HOUR_END, 6);
 
 const TF = process.env.TF || "5m";
 const LOOKBACK = num(process.env.LOOKBACK, 600);
 
-const MAX_CONCURRENT_POSITIONS = num(process.env.MAX_CONCURRENT_POSITIONS, 3);
 const LOOP_DELAY_MS = 1500;
 
-// ======================== HELPERS ========================
+// =============== HELPERS ===============
 function num(v: any, d: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
@@ -86,7 +87,6 @@ type NumT = number | undefined | null;
 const asNum = (v: NumT): number =>
   typeof v === "number" && Number.isFinite(v) ? v : 0;
 
-// ccxt OHLCV normalized to strict numbers: [ts, open, high, low, close, vol]
 type OHLCVRow = [number, number, number, number, number, number];
 function normalizeOHLCV(rows: any[]): OHLCVRow[] {
   return rows
@@ -103,15 +103,35 @@ function normalizeOHLCV(rows: any[]): OHLCVRow[] {
     )
     .filter((r) => r[4] > 0);
 }
-
 function bps(from: number, to: number) {
   return (to / from - 1) * 10000;
 }
 
-// ======================== TELEGRAM ========================
+// precision & min-notional helpers
+function floorToPrecision(v: number, step?: number) {
+  if (!step || step <= 0) return v;
+  return Math.floor(v / step) * step;
+}
+async function getAmountStep(symbol: string): Promise<number | undefined> {
+  try {
+    const m =
+      exchange.markets[symbol] || (await exchange.loadMarkets())[symbol];
+    if (!m) return undefined;
+    if (m.precision && typeof m.precision.amount === "number") {
+      const p = m.precision.amount; // e.g., 6 -> 0.000001
+      return Number((1 / Math.pow(10, p)).toFixed(p));
+    }
+    return m.limits?.amount?.min ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// =============== TELEGRAM ===============
 async function tg(text: string) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
+    // Node 18+ has global fetch; if not, install node-fetch and import.
     await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -124,31 +144,26 @@ async function tg(text: string) {
   } catch {}
 }
 
-// ======================== WS TICKER (Upbit) ========================
+// =============== WS TICKER (Upbit) ===============
 const WSS = "wss://api.upbit.com/websocket/v1";
 function toUpbitCode(ccxtSymbol: string) {
   const [base, quote] = ccxtSymbol.split("/");
-  return `${quote}-${base}`; // e.g., KRW-BTC
+  return `${quote}-${base}`; // KRW-BTC
 }
-
 class UpbitTickerFeed {
   private ws: WebSocket | null = null;
   private latest = new Map<string, number>(); // code -> trade_price
   private codes: string[];
   private alive = false;
-
   constructor(codes: string[]) {
     this.codes = codes;
   }
-
   get(code: string) {
     return this.latest.get(code);
   }
-
   connect() {
     this.ws = new WebSocket(WSS);
     this.ws.binaryType = "arraybuffer";
-
     this.ws.on("open", () => {
       this.alive = true;
       const sub = [
@@ -157,25 +172,21 @@ class UpbitTickerFeed {
       ];
       this.ws?.send(Buffer.from(JSON.stringify(sub)));
     });
-
     this.ws.on("message", (buf: WebSocket.RawData) => {
       try {
         const s = buf.toString();
         const j = JSON.parse(s);
-        if (j && j.code && typeof j.trade_price === "number") {
+        if (j && j.code && typeof j.trade_price === "number")
           this.latest.set(j.code, j.trade_price);
-        }
       } catch {
         try {
           const text = new TextDecoder().decode(buf as Buffer);
           const j = JSON.parse(text);
-          if (j && j.code && typeof j.trade_price === "number") {
+          if (j && j.code && typeof j.trade_price === "number")
             this.latest.set(j.code, j.trade_price);
-          }
         } catch {}
       }
     });
-
     const ping = setInterval(() => {
       if (this.alive) {
         try {
@@ -198,19 +209,19 @@ class UpbitTickerFeed {
   }
 }
 
-// ======================== EXCHANGE ========================
+// =============== EXCHANGE ===============
 const exchange = new ccxt.upbit({
   apiKey: UPBIT_API_KEY,
   secret: UPBIT_SECRET,
   enableRateLimit: true,
   options: {
     adjustForTimeDifference: true,
-    // ✅ allow market buy by quote cost
+    // allow market buy by KRW cost (Upbit-specific)
     createMarketBuyOrderRequiresPrice: false,
   },
 });
 
-// ======================== STATE ========================
+// =============== STATE ===============
 type Pos = {
   entry: number;
   size: number; // base amount
@@ -220,7 +231,6 @@ type Pos = {
   openedAt: number;
   bePrice?: number;
 };
-
 const positions = new Map<string, Pos>();
 const tradesToday = new Map<string, number>();
 let paused = false;
@@ -228,7 +238,6 @@ let paused = false;
 function allocKRW() {
   return Math.floor(BASE_CAPITAL_KRW * POS_PCT);
 }
-
 function canEnter(symbol: string) {
   if (paused) return false;
   const h = hourKST();
@@ -246,11 +255,10 @@ function incTrade(symbol: string) {
   tradesToday.set(symbol, (tradesToday.get(symbol) || 0) + 1);
 }
 
-// ======================== INDICATORS ========================
+// =============== INDICATORS ===============
 function ema(values: number[], period: number) {
   return EMA.calculate({ values, period });
 }
-
 function macdHist(values: number[]) {
   const r = MACD.calculate({
     values,
@@ -266,7 +274,6 @@ function macdHist(values: number[]) {
     last && typeof last.histogram === "number" ? (last.histogram as number) : 0;
   return h;
 }
-
 function regimeOK(closes: number[]) {
   if (!USE_REGIME_FILTER) return true;
   const ef = ema(closes, REGIME_EMA_FAST);
@@ -275,40 +282,31 @@ function regimeOK(closes: number[]) {
   const lastFast = ef[ef.length - 1]!;
   const lastSlow = es[es.length - 1]!;
   if (!(lastFast > lastSlow)) return false;
-  if (USE_MACD_CONFIRM) {
-    const hist = macdHist(closes);
-    if (!(hist > 0)) return false;
-  }
+  if (USE_MACD_CONFIRM && !(macdHist(closes) > 0)) return false;
   return true;
 }
-
 function breakoutOK(ohlcv: OHLCVRow[]) {
   const n = ohlcv.length;
   if (n < BREAKOUT_LOOKBACK + 2) return false;
-
   const highs = ohlcv.map((r) => r[2]);
   const last = ohlcv[n - 1]!;
   const priorSlice = highs.slice(n - 1 - BREAKOUT_LOOKBACK, n - 1);
   if (!priorSlice.length) return false;
-
   const priorHigh = Math.max(...priorSlice);
   const tol = priorHigh * (BREAKOUT_TOL_BPS / 10000);
-
   const closeOK = last[4] >= priorHigh - tol;
   const highOK = USE_HIGH_BREAKOUT ? last[2] >= priorHigh - tol : false;
   return closeOK || highOK;
 }
 
-// ======================== ORDERS ========================
+// =============== ORDERS ===============
 async function marketBuy(symbol: string, krw: number, pxGuide: number) {
   if (krw < LIVE_MIN_ORDER_KRW)
     return { ok: false, reason: "below-min" as const };
-  if (MODE === "paper" || KILL_SWITCH) {
+  if (MODE === "paper" || KILL_SWITCH)
     return { ok: true, paper: true, amount: krw / pxGuide };
-  }
   try {
-    // ✅ Upbit market buy by quote "cost"
-    const params: any = { cost: krw };
+    const params: any = { cost: krw }; // Upbit market buy by KRW cost
     const o = await exchange.createOrder(
       symbol,
       "market",
@@ -320,7 +318,6 @@ async function marketBuy(symbol: string, krw: number, pxGuide: number) {
     const filledAmount = (o as any).amount ?? krw / pxGuide;
     return { ok: true, id: o.id, amount: filledAmount };
   } catch (e: any) {
-    // Fallback: also pass qty if needed
     try {
       const qty = krw / pxGuide;
       const o2 = await exchange.createOrder(
@@ -342,7 +339,11 @@ async function marketSell(symbol: string, amount: number) {
   if (amount <= 0) return { ok: false, reason: "zero-amount" as const };
   if (MODE === "paper" || KILL_SWITCH) return { ok: true, paper: true };
   try {
-    const o = await exchange.createOrder(symbol, "market", "sell", amount);
+    const step = await getAmountStep(symbol);
+    const amt = floorToPrecision(amount, step);
+    if (amt <= 0)
+      return { ok: false, reason: "precision-trim-to-zero" as const };
+    const o = await exchange.createOrder(symbol, "market", "sell", amt);
     return { ok: true, id: o.id };
   } catch (e: any) {
     return { ok: false, reason: e?.message || "sell-failed" };
@@ -356,14 +357,14 @@ async function reconcile(symbol: string) {
   } catch {}
 }
 
-// ======================== RUNNER ========================
+// =============== RUNNER ===============
 async function runner(symbol: string, feed: UpbitTickerFeed) {
   await tg(`▶️ 시작: ${symbol} | MODE=${MODE} | paused=${paused}`);
   while (true) {
     try {
       await reconcile(symbol);
 
-      // Fetch candles & normalize
+      // Candles
       const raw = await exchange.fetchOHLCV(symbol, TF, undefined, LOOKBACK);
       const ohlcv = normalizeOHLCV(raw);
       if (!ohlcv.length) {
@@ -371,45 +372,76 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         continue;
       }
 
-      const closes = ohlcv.map((r) => r[4]); // number[]
+      const closes = ohlcv.map((r) => r[4]);
       const last = ohlcv[ohlcv.length - 1]!;
-      const lastPx = last[4]; // number
+      const lastPx = last[4];
 
+      // Price
       const code = toUpbitCode(symbol);
-      const wsPx = feed.get(code) ?? lastPx; // prefer WS price
+      const wsPx = feed.get(code) ?? lastPx;
 
       const pos = positions.get(symbol);
 
       if (pos) {
-        // TP ladder
+        // ---- TP ladder ----
         if (!pos.tookTP1 && wsPx >= pos.entry * (1 + TP1)) {
-          const amt = pos.size * 0.3;
-          const r = await marketSell(symbol, amt);
-          if (r.ok) {
-            pos.size -= amt;
-            pos.tookTP1 = true;
-            if (USE_BEP_AFTER_TP1)
-              pos.bePrice = pos.entry * (1 + BEP_OFFSET_BPS / 10000);
+          const step = await getAmountStep(symbol);
+          let amt = floorToPrecision(pos.size * 0.3, step);
+          if (amt <= 0 || amt * wsPx < LIVE_MIN_ORDER_KRW) {
             await tg(
-              `🟢 TP1 ${symbol} @ +${(TP1 * 100).toFixed(
-                2
-              )}% | 남은 ${pos.size.toFixed(6)}`
+              `⚠️ TP1 스킵 ${symbol} | 최소금액/정밀도 미달 (amt≈${amt.toFixed(
+                8
+              )}, KRW≈${Math.round(amt * wsPx)})`
             );
+          } else {
+            const r = await marketSell(symbol, amt);
+            if (r.ok) {
+              pos.size -= amt;
+              pos.tookTP1 = true;
+              if (USE_BEP_AFTER_TP1)
+                pos.bePrice = pos.entry * (1 + BEP_OFFSET_BPS / 10000);
+              await tg(
+                `🟢 TP1 ${symbol} | +${(TP1 * 100).toFixed(2)}% | ${amt.toFixed(
+                  6
+                )} 청산 | 남은 ${pos.size.toFixed(6)}`
+              );
+            } else {
+              await tg(
+                `❗ TP1 매도 실패 ${symbol} | ${
+                  r.reason || "unknown"
+                } (보유 유지 후 재시도)`
+              );
+            }
           }
         } else if (wsPx >= pos.entry * (1 + TP2)) {
-          const amt = pos.size * 0.3;
-          const r = await marketSell(symbol, amt);
-          if (r.ok) {
-            pos.size -= amt;
+          const step = await getAmountStep(symbol);
+          let amt = floorToPrecision(pos.size * 0.3, step);
+          if (amt <= 0 || amt * wsPx < LIVE_MIN_ORDER_KRW) {
             await tg(
-              `🟢 TP2 ${symbol} @ +${(TP2 * 100).toFixed(
-                2
-              )}% | 남은 ${pos.size.toFixed(6)}`
+              `⚠️ TP2 스킵 ${symbol} | 최소금액/정밀도 미달 (amt≈${amt.toFixed(
+                8
+              )}, KRW≈${Math.round(amt * wsPx)})`
             );
+          } else {
+            const r = await marketSell(symbol, amt);
+            if (r.ok) {
+              pos.size -= amt;
+              await tg(
+                `🟢 TP2 ${symbol} | +${(TP2 * 100).toFixed(2)}% | ${amt.toFixed(
+                  6
+                )} 청산 | 남은 ${pos.size.toFixed(6)}`
+              );
+            } else {
+              await tg(
+                `❗ TP2 매도 실패 ${symbol} | ${
+                  r.reason || "unknown"
+                } (보유 유지 후 재시도)`
+              );
+            }
           }
         }
 
-        // trailing & stops
+        // ---- trailing & stops ----
         pos.peak = Math.max(pos.peak, wsPx);
         const trailLine = pos.peak * (1 + TRAIL);
         const hardSL = pos.entry * (1 + STOP_LOSS);
@@ -417,7 +449,25 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         const stopLine = Math.max(dynSL, trailLine);
 
         if (wsPx <= stopLine || pos.size <= 0) {
-          const r = await marketSell(symbol, pos.size);
+          const step = await getAmountStep(symbol);
+          let amt = floorToPrecision(pos.size, step);
+
+          if (amt <= 0) {
+            await tg(`⚠️ EXIT 보류 ${symbol} | 정밀도 보정 결과 수량 0`);
+            await sleep(LOOP_DELAY_MS);
+            continue;
+          }
+          if (amt * wsPx < LIVE_MIN_ORDER_KRW) {
+            await tg(
+              `⚠️ EXIT 불가(먼지) ${symbol} | 가치≈${Math.round(
+                amt * wsPx
+              )} KRW < ${LIVE_MIN_ORDER_KRW} KRW`
+            );
+            await sleep(LOOP_DELAY_MS);
+            continue; // keep position; retry later
+          }
+
+          const r = await marketSell(symbol, amt);
           if (r.ok) {
             const pnl = (wsPx / pos.entry - 1) * 100;
             await tg(
@@ -425,15 +475,25 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 wsPx
               )} | ${pnl.toFixed(2)}%`
             );
+            positions.delete(symbol);
+          } else {
+            await tg(
+              `❗ EXIT 매도 실패 ${symbol} | ${
+                r.reason || "unknown"
+              } | 재시도 대기`
+            );
+            // keep position for retry
           }
-          positions.delete(symbol);
+
+          await sleep(LOOP_DELAY_MS);
+          continue;
         }
 
         await sleep(LOOP_DELAY_MS);
         continue;
       }
 
-      // Flat → Entry checks
+      // ---- Entry ----
       if (!canEnter(symbol)) {
         await sleep(LOOP_DELAY_MS);
         continue;
@@ -445,7 +505,6 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         continue;
       }
 
-      // Price guard vs last close
       const drift = Math.abs(bps(lastPx, wsPx));
       if (drift > ENTRY_SLIPPAGE_BPS) {
         await sleep(LOOP_DELAY_MS);
@@ -497,7 +556,7 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ======================== MAIN ========================
+// =============== MAIN ===============
 async function main() {
   const symbols = TRADE_COINS.length ? TRADE_COINS : [SYMBOL_CCXT];
   const codes = symbols.map(toUpbitCode);
@@ -509,6 +568,21 @@ async function main() {
       ", "
     )} | TF=${TF} | paused=${paused}`
   );
+
+  // Balance vs state mismatch warning (read-only)
+  try {
+    const bal = await exchange.fetchBalance();
+    for (const s of symbols) {
+      const base = s.split("/")[0];
+      const qty = (bal.total?.[base] as number) || 0;
+      if (qty > 0 && !positions.has(s)) {
+        await tg(
+          `⚠️ 잔고-상태 불일치: ${s} 보유≈${qty} (봇 내부 포지션 없음). 수동 확인 권장.`
+        );
+      }
+    }
+  } catch {}
+
   symbols.forEach((s) => {
     runner(s, feed);
   });
