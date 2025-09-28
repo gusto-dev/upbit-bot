@@ -60,14 +60,15 @@ type Pos = {
   entry: number;
   size: number;
   invested: number;
-  peak?: number;
-  tookTP1?: boolean;
+  peak: number; // persist 타입에 맞춰 필수
+  tookTP1: boolean; // persist 타입에 맞춰 필수
   openedAt: number;
 };
 const positions: Map<string, Pos> = new Map();
 
-type DayCounter = { day: string; count: number };
-const tradeCounter: Map<string, DayCounter> = new Map(); // 심볼별 일일 진입횟수
+// tradesToday: persist 규격에 맞게 "숫자만" 저장
+const tradeCounter: Map<string, number> = new Map();
+let paused = false; // persist용
 
 // ===================== EXCHANGE =====================
 const exchange = new ccxt.upbit({
@@ -281,7 +282,7 @@ async function reconcilePositionsFromWallet(
         if (diffPctBps > SYNC_TOLERANCE_BPS) {
           pos.size = walletQty;
           pos.invested = walletQty * lastPx;
-          pos.peak = Math.max(pos.peak ?? lastPx, lastPx);
+          pos.peak = Math.max(pos.peak, lastPx);
           positions.set(s, pos);
           await tg(
             `🔄 동기화: ${s} 사이즈 보정 | qty≈${walletQty.toFixed(
@@ -308,23 +309,23 @@ function todayStrKST() {
     .toISOString()
     .slice(0, 10);
 }
-function incTradeCount(sym: string) {
-  const t = tradeCounter.get(sym);
-  const today = todayStrKST();
-  if (!t || t.day !== today) {
-    tradeCounter.set(sym, { day: today, count: 1 });
-    return 1;
-  } else {
-    t.count += 1;
-    tradeCounter.set(sym, t);
-    return t.count;
+let counterDay = todayStrKST();
+function ensureDayFresh() {
+  const t = todayStrKST();
+  if (t !== counterDay) {
+    tradeCounter.clear(); // 날짜 바뀌면 일일 카운터 리셋
+    counterDay = t;
   }
 }
+function incTradeCount(sym: string) {
+  ensureDayFresh();
+  const n = (tradeCounter.get(sym) || 0) + 1;
+  tradeCounter.set(sym, n);
+  return n;
+}
 function getTradeCount(sym: string) {
-  const t = tradeCounter.get(sym);
-  const today = todayStrKST();
-  if (!t || t.day !== today) return 0;
-  return t.count;
+  ensureDayFresh();
+  return tradeCounter.get(sym) || 0;
 }
 
 async function marketBuy(symbol: string, lastPx: number) {
@@ -424,7 +425,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         // ====== 보유 포지션 관리 ======
         if (inPos && pos) {
           // 트레일링/TP/손절
-          if (!pos.peak || lastPx > pos.peak) pos.peak = lastPx;
+          if (lastPx > pos.peak) pos.peak = lastPx;
 
           const pnlPct = (lastPx - pos.entry) / pos.entry;
 
@@ -455,7 +456,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             } else {
               await tg(`❗ TP2 실패: ${symbol} | ${r.reason}`);
             }
-          } else if (pos.peak && (lastPx - pos.peak) / pos.peak <= TRAIL) {
+          } else if ((lastPx - pos.peak) / pos.peak <= TRAIL) {
             const r = await marketSell(symbol, pos.size);
             if (r.ok) {
               positions.delete(symbol);
@@ -531,7 +532,7 @@ async function main() {
   const symbols = TRADE_COINS.length ? TRADE_COINS : [SYMBOL_CCXT];
   const codes = symbols.map(toUpbitCode);
 
-  // 이전 상태 복구(선택)
+  // 이전 상태 복구
   try {
     const prev = await loadState();
     if (prev?.positions) {
@@ -540,6 +541,17 @@ async function main() {
       )) {
         positions.set(k, v);
       }
+    }
+    if (prev?.tradesToday) {
+      // Record<string, number>
+      for (const [k, v] of Object.entries(
+        prev.tradesToday as Record<string, number>
+      )) {
+        tradeCounter.set(k, Number(v) || 0);
+      }
+    }
+    if (typeof (prev as any).paused !== "undefined") {
+      paused = Boolean((prev as any).paused);
     }
   } catch {}
 
@@ -579,18 +591,75 @@ async function main() {
   process.on("SIGINT", async () => {
     await tg("👋 종료(SIGINT)");
     try {
-      const out: Record<string, Pos> = {};
-      positions.forEach((v, k) => (out[k] = v));
-      await saveState({ positions: out, ts: Date.now() });
+      // persist 타입에 딱 맞게 정규화하여 저장
+      const outStrict: Record<
+        string,
+        {
+          entry: number;
+          size: number;
+          invested: number;
+          peak: number;
+          tookTP1: boolean;
+          openedAt: number;
+          bePrice?: number;
+        }
+      > = {};
+      positions.forEach((v, k) => {
+        outStrict[k] = {
+          entry: Number(v.entry) || 0,
+          size: Number(v.size) || 0,
+          invested: Number(v.invested) || 0,
+          peak: Number(v.peak ?? v.entry) || 0,
+          tookTP1: Boolean(v.tookTP1),
+          openedAt: Number(v.openedAt) || Date.now(),
+        };
+      });
+
+      const tradesTodayObj: Record<string, number> = {};
+      tradeCounter.forEach((cnt, k) => (tradesTodayObj[k] = Number(cnt) || 0));
+
+      await saveState({
+        positions: outStrict,
+        tradesToday: tradesTodayObj,
+        paused,
+      });
     } catch {}
     process.exit(0);
   });
   process.on("SIGTERM", async () => {
     await tg("👋 종료(SIGTERM)");
     try {
-      const out: Record<string, Pos> = {};
-      positions.forEach((v, k) => (out[k] = v));
-      await saveState({ positions: out, ts: Date.now() });
+      const outStrict: Record<
+        string,
+        {
+          entry: number;
+          size: number;
+          invested: number;
+          peak: number;
+          tookTP1: boolean;
+          openedAt: number;
+          bePrice?: number;
+        }
+      > = {};
+      positions.forEach((v, k) => {
+        outStrict[k] = {
+          entry: Number(v.entry) || 0,
+          size: Number(v.size) || 0,
+          invested: Number(v.invested) || 0,
+          peak: Number(v.peak ?? v.entry) || 0,
+          tookTP1: Boolean(v.tookTP1),
+          openedAt: Number(v.openedAt) || Date.now(),
+        };
+      });
+
+      const tradesTodayObj: Record<string, number> = {};
+      tradeCounter.forEach((cnt, k) => (tradesTodayObj[k] = Number(cnt) || 0));
+
+      await saveState({
+        positions: outStrict,
+        tradesToday: tradesTodayObj,
+        paused,
+      });
     } catch {}
     process.exit(0);
   });
