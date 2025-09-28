@@ -140,6 +140,16 @@ function bps(from: number, to: number) {
   return (to / from - 1) * 10000;
 }
 
+function getBalanceTotal(bal: any, base: string): number {
+  try {
+    const t = (bal?.total ?? {}) as Record<string, number>;
+    const v = Number(t[base] ?? 0);
+    return Number.isFinite(v) ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
 // precision & min-notional helpers
 function floorToPrecision(v: number, step?: number) {
   if (!step || step <= 0) return v;
@@ -165,7 +175,7 @@ async function getWalletBaseAmount(symbol: string): Promise<number> {
   try {
     const base = symbol.split("/")[0];
     const bal = await exchange.fetchBalance();
-    const q = Number(bal.total?.[base] ?? 0);
+    const q = getBalanceTotal(bal, base);
     return Number.isFinite(q) ? q : 0;
   } catch {
     return 0;
@@ -363,29 +373,17 @@ async function marketBuy(symbol: string, krw: number, pxGuide: number) {
     return { ok: false, reason: "below-min" as const };
   if (MODE === "paper" || KILL_SWITCH)
     return { ok: true, paper: true, amount: krw / pxGuide };
+
   try {
-    const params: any = { cost: krw }; // Upbit market buy by KRW cost
-    const o = await exchange.createOrder(
-      symbol,
-      "market",
-      "buy",
-      undefined,
-      undefined,
-      params
-    );
-    const filledAmount = (o as any).amount ?? krw / pxGuide;
+    // ✅ Upbit/ccxt: amount 자리에 "지출할 KRW"를 넣는다 (price 생략)
+    const o = await exchange.createOrder(symbol, "market", "buy", krw);
+    const filledAmount = (o as any).amount ?? krw / pxGuide; // 체결된 베이스 수량
     return { ok: true, id: o.id, amount: filledAmount };
   } catch (e: any) {
+    // 폴백: 견적가로 수량을 계산해 시도
     try {
       const qty = krw / pxGuide;
-      const o2 = await exchange.createOrder(
-        symbol,
-        "market",
-        "buy",
-        qty,
-        undefined,
-        { cost: krw }
-      );
+      const o2 = await exchange.createOrder(symbol, "market", "buy", qty);
       return { ok: true, id: o2.id, amount: (o2 as any).amount ?? qty };
     } catch (e2: any) {
       return { ok: false, reason: e2?.message || e?.message || "buy-failed" };
@@ -674,7 +672,7 @@ async function main() {
     const bal = await exchange.fetchBalance();
     for (const s of symbols) {
       const base = s.split("/")[0];
-      const qty = Number(bal.total?.[base] ?? 0);
+      const qty = getBalanceTotal(bal, base);
       if (qty > 0 && !positions.has(s)) {
         await tg(
           `⚠️ 잔고-상태 불일치: ${s} 보유≈${qty} (봇 포지션 없음). 수동 확인 권장.`
