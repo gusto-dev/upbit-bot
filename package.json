@@ -8,7 +8,7 @@
     "build": "tsc -p .",
     "start": "node --enable-source-maps dist/bot.js",
     "start:dev": "tsx src/bot.ts",
-    "postbuild": "npm prune --omit=dev"
+    "postbuild": "echo skip prune"
   },
   "keywords": [],
   "author": "",

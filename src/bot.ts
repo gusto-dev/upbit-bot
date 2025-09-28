@@ -99,14 +99,24 @@ async function tg(text: string) {
         }),
       }
     );
-    const data = await res.json();
-    if (!data?.ok)
-      console.error("TG send failed:", res.status, JSON.stringify(data));
+    type TgResp = { ok: boolean; [k: string]: any };
+    const data: unknown = await res.json().catch(() => undefined);
+    if (!isTgResp(data) || !data.ok) {
+      console.error(
+        "TG send failed:",
+        res.status,
+        typeof data === "object" ? JSON.stringify(data) : String(data)
+      );
+    }
   } catch (e: any) {
     console.error("TG error:", e?.message || e);
   } finally {
     clearTimeout(timer);
   }
+}
+
+function isTgResp(v: unknown): v is { ok: boolean } {
+  return !!v && typeof v === "object" && "ok" in v;
 }
 
 // ===================== HELPERS =====================
@@ -156,17 +166,26 @@ function floorToStep(v: number, step: number) {
   if (!step || step <= 0) return v;
   return Math.floor(v / step) * step;
 }
-function getMarketInfo(symbol: string) {
-  const m = exchange.markets?.[symbol];
-  return m || {};
+function getMarketInfo(symbol: string): { precision?: { amount?: number } } {
+  const m = (exchange as any).markets?.[symbol];
+  return (m || {}) as { precision?: { amount?: number } };
 }
 
 // 캔들/지표
-async function fetchCandles(symbol: string, tf: string, limit = 200) {
+async function fetchCandles(
+  symbol: string,
+  tf: string,
+  limit = 200
+): Promise<Candle[]> {
   try {
-    return await exchange.fetchOHLCV(symbol, tf, undefined, limit);
+    return (await exchange.fetchOHLCV(
+      symbol,
+      tf,
+      undefined,
+      limit
+    )) as Candle[];
   } catch {
-    return [];
+    return [] as Candle[];
   }
 }
 function ema(values: number[], period: number): number[] {
@@ -392,9 +411,9 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
       }
 
       // 마지막 봉 안전 파싱
-      const lastCandle = last(candles, 1)[0];
-      const tOpen = Number(lastCandle?.[0]) || lastBarTs || 0;
-      const tClose = Number(lastCandle?.[4]) || lastPx || 0;
+      const lastCandle: Candle | undefined = last(candles, 1)[0];
+      const tOpen = lastCandle ? Number(lastCandle[0]) : lastBarTs || 0;
+      const tClose = lastCandle ? Number(lastCandle[4]) : lastPx || 0;
 
       // 같은 봉/같은 가격이면 간격만 둔다
       if (tOpen === lastBarTs && lastPx === tClose) {
@@ -403,8 +422,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         lastBarTs = tOpen;
 
         // number[]로 강제 변환
-        const closes: number[] = candles.map((c) => Number(c?.[4]) || 0);
-        const highs: number[] = candles.map((c) => Number(c?.[2]) || 0);
+        const closes: number[] = candles.map((c: Candle) => Number(c[4]) || 0);
+        const highs: number[] = candles.map((c: Candle) => Number(c[2]) || 0);
 
         const len = closes.length;
         const fastLen = Math.min(REGIME_EMA_FAST, len);
