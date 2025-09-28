@@ -1,801 +1,168 @@
-// src/bot.ts
-// Upbit multi-coin aggressive trader (TSX runtime, no build).
-// - .env를 'dotenv' 패키지 없이 직접 로드(경량 로더).
-// - 보유중이면 신규매수 스킵, 지갑 잔고 기준 매도(정밀도/최소금액 체크).
-// - TP1/TP2 + BEP + 트레일 + 고정 손절 + 강제 손절(FORCE_EXIT_DD_BPS).
-// - Upbit 시장가 매수는 KRW cost 방식(ccxt option) 사용.
-// - 텔레그램 전송 실패는 콘솔에 이유 출력.
-
-import fs from "fs";
-import path from "path";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import "dotenv/config";
 import ccxt from "ccxt";
-import WebSocket from "ws";
-import { EMA, MACD } from "technicalindicators";
+import { UpbitTickerFeed } from "./wsTicker";
+import { loadState, saveState } from "./persist";
 
-// =============== .env 경량 로더 (dotenv 대체) ===============
-(function loadEnv() {
-  try {
-    const p = path.resolve(process.cwd(), ".env");
-    if (!fs.existsSync(p)) return;
-    const txt = fs.readFileSync(p, "utf8");
-    for (const raw of txt.split(/\r?\n/)) {
-      const line = raw.trim();
-      if (!line || line.startsWith("#")) continue;
-      const m = line.match(/^([\w.-]+)\s*=\s*(.*)$/);
-      if (!m) continue;
-      const key = m[1];
-      let val = m[2];
-      if (
-        (val.startsWith('"') && val.endsWith('"')) ||
-        (val.startsWith("'") && val.endsWith("'"))
-      ) {
-        val = val.slice(1, -1);
-      }
-      if (process.env[key] === undefined) process.env[key] = val;
-    }
-  } catch {}
-})();
-
-// =============== ENV ===============
-const MODE = (process.env.MODE || "live").toLowerCase(); // live | paper
-const KILL_SWITCH =
-  (process.env.KILL_SWITCH || "false").toLowerCase() === "true";
-
+// ===================== ENV =====================
+const MODE = (process.env.MODE || "live") as "live" | "paper";
+const SYMBOL_CCXT = process.env.SYMBOL_CCXT || "BTC/KRW";
 const TRADE_COINS = (process.env.TRADE_COINS || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(s => s.trim())
   .filter(Boolean);
-const SYMBOL_CCXT = process.env.SYMBOL_CCXT || "BTC/KRW";
 
-const UPBIT_API_KEY = process.env.UPBIT_API_KEY || "";
-const UPBIT_SECRET = process.env.UPBIT_SECRET || "";
+const TF = process.env.TF || "5m";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
-const BASE_CAPITAL_KRW = num(process.env.BASE_CAPITAL_KRW, 500000);
-const POS_PCT = num(process.env.POS_PCT, 0.12);
-const LIVE_MIN_ORDER_KRW = num(process.env.LIVE_MIN_ORDER_KRW, 5000);
+const UPBIT_API_KEY = process.env.UPBIT_API_KEY || "";
+const UPBIT_SECRET = process.env.UPBIT_SECRET || "";
 
-const ENTRY_SLIPPAGE_BPS = num(process.env.ENTRY_SLIPPAGE_BPS, 30); // 0.30%
+// 안전장치/전략 파라미터 (필요시 .env로 조정)
+const BASE_CAPITAL_KRW = Number(process.env.BASE_CAPITAL_KRW ?? 500000);  // 기준 자본
+const POS_PCT          = Number(process.env.POS_PCT ?? 0.12);             // 12% 배팅
+const LIVE_MIN_ORDER_KRW = Number(process.env.LIVE_MIN_ORDER_KRW ?? 5000);// 거래소 최소주문가 이상
 
-const BREAKOUT_LOOKBACK = num(process.env.BREAKOUT_LOOKBACK, 6);
-const BREAKOUT_TOL_BPS = num(process.env.BREAKOUT_TOL_BPS, 15);
-const USE_HIGH_BREAKOUT = bool(process.env.USE_HIGH_BREAKOUT, true);
+const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 30);  // 0.30% 이내 체결 허용
 
-const USE_REGIME_FILTER = bool(process.env.USE_REGIME_FILTER, true);
-const REGIME_EMA_FAST = num(process.env.REGIME_EMA_FAST, 20);
-const REGIME_EMA_SLOW = num(process.env.REGIME_EMA_SLOW, 60);
-const USE_MACD_CONFIRM = bool(process.env.USE_MACD_CONFIRM, false);
-const MACD_FAST = num(process.env.MACD_FAST, 12);
-const MACD_SLOW = num(process.env.MACD_SLOW, 26);
-const MACD_SIGNAL = num(process.env.MACD_SIGNAL, 9);
+const BREAKOUT_LOOKBACK  = Number(process.env.BREAKOUT_LOOKBACK ?? 6);    // 최근 N봉 고가 돌파 시 진입
+const BREAKOUT_TOL_BPS   = Number(process.env.BREAKOUT_TOL_BPS ?? 15);    // 돌파 허용 오차
 
-const STOP_LOSS = num(process.env.STOP_LOSS, -0.012); // -1.2%
-const TP1 = num(process.env.TP1, 0.012); // +1.2%
-const TP2 = num(process.env.TP2, 0.022); // +2.2%
-const TRAIL = num(process.env.TRAIL, -0.015); // 피크 대비 -1.5%
-const USE_BEP_AFTER_TP1 = bool(process.env.USE_BEP_AFTER_TP1, true);
-const BEP_OFFSET_BPS = num(process.env.BEP_OFFSET_BPS, 0);
+const USE_REGIME_FILTER  = String(process.env.USE_REGIME_FILTER ?? "true") === "true";
+const REGIME_EMA_FAST    = Number(process.env.REGIME_EMA_FAST ?? 20);
+const REGIME_EMA_SLOW    = Number(process.env.REGIME_EMA_SLOW ?? 60);
 
-const MAX_TRADES_PER_DAY = num(process.env.MAX_TRADES_PER_DAY, 4);
-const MAX_CONCURRENT_POSITIONS = num(process.env.MAX_CONCURRENT_POSITIONS, 3);
-const QUIET_HOUR_START = num(process.env.QUIET_HOUR_START, 2);
-const QUIET_HOUR_END =
-  num(
-    process.env.QUI_HOUR_END,
-    Number.isFinite(Number(process.env.QUIET_HOUR_END))
-      ? Number(process.env.QUIET_HOUR_END)
-      : 6
-  ) || 6; // 안전
+const TP1                = Number(process.env.TP1 ?? 0.012);              // +1.2% 절반 익절
+const TP2                = Number(process.env.TP2 ?? 0.022);              // +2.2% 전량 익절
+const TRAIL              = Number(process.env.TRAIL ?? -0.015);           // -1.5% 트레일
+const USE_BEP_AFTER_TP1  = String(process.env.USE_BEP_AFTER_TP1 ?? "true") === "true";
 
-const TF = process.env.TF || "5m";
-const LOOKBACK = num(process.env.LOOKBACK, 600);
+const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY ?? 4);
+const MAX_CONCURRENT_POS = Number(process.env.MAX_CONCURRENT_POSITIONS ?? 3);
 
-const ENTRY_SKIP_IF_WALLET = bool(process.env.ENTRY_SKIP_IF_WALLET, true);
-const ENTRY_WALLET_MIN_KRW = num(
-  process.env.ENTRY_WALLET_MIN_KRW,
-  LIVE_MIN_ORDER_KRW
-);
+const QUIET_HOUR_START   = Number(process.env.QUIET_HOUR_START ?? 2);     // 02:00~06:00 엔트리 금지
+const QUIET_HOUR_END     = Number(process.env.QUIET_HOUR_END ?? 6);
 
-const FORCE_EXIT_DD_BPS = Number(process.env.FORCE_EXIT_DD_BPS ?? "0"); // 예:-500 -> -5%
+// 동기화 옵션
+const SYNC_MIN_KRW = Number(process.env.SYNC_MIN_KRW ?? 3000);
+const SYNC_TOLERANCE_BPS = Number(process.env.SYNC_TOLERANCE_BPS ?? 50);
+const SYNC_POS_INTERVAL_MIN = Number(process.env.SYNC_POS_INTERVAL_MIN ?? 15);
+const REMOVE_STRIKE_REQUIRED = Number(process.env.SYNC_REMOVE_STRIKE ?? 2);
 
-const LOOP_DELAY_MS = 1500;
+// ===================== TYPES/STATE =====================
+type Pos = {
+  entry: number;
+  size: number;
+  invested: number;
+  peak?: number;
+  tookTP1?: boolean;
+  openedAt: number;
+};
+const positions: Map<string, Pos> = new Map();
 
-const DUST_KRW_MIN = 3000;
+type DayCounter = { day: string; count: number };
+const tradeCounter: Map<string, DayCounter> = new Map(); // 심볼별 일일 진입횟수
 
-// =============== HELPERS ===============
-function num(v: any, d: number) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-}
-function bool(v: any, d: boolean) {
-  const s = String(v || "").toLowerCase();
-  if (["1", "true", "yes", "y"].includes(s)) return true;
-  if (["0", "false", "no", "n"].includes(s)) return false;
-  return d;
-}
-const nowKST = () => new Date(Date.now() + 9 * 3600 * 1000);
-const hourKST = () => nowKST().getUTCHours();
+// ===================== EXCHANGE =====================
+const exchange = new ccxt.upbit({
+  apiKey: UPBIT_API_KEY || undefined,
+  secret: UPBIT_SECRET || undefined,
+  enableRateLimit: true,
+});
 
-type NumT = number | undefined | null;
-const asNum = (v: NumT): number =>
-  typeof v === "number" && Number.isFinite(v) ? v : 0;
-
-type OHLCVRow = [number, number, number, number, number, number];
-function normalizeOHLCV(rows: any[]): OHLCVRow[] {
-  return rows
-    .map(
-      (r) =>
-        [
-          asNum(r[0]),
-          asNum(r[1]),
-          asNum(r[2]),
-          asNum(r[3]),
-          asNum(r[4]),
-          asNum(r[5]),
-        ] as OHLCVRow
-    )
-    .filter((r) => r[4] > 0);
-}
-function bps(from: number, to: number) {
-  return (to / from - 1) * 10000;
-}
-
-function getBalanceTotal(bal: any, base: string): number {
-  try {
-    const t = (bal?.total ?? {}) as Record<string, number>;
-    const v = Number(t[base] ?? 0);
-    return Number.isFinite(v) ? v : 0;
-  } catch {
-    return 0;
-  }
-}
-
-// precision & min-notional helpers
-function floorToPrecision(v: number, step?: number) {
-  if (!step || step <= 0) return v;
-  return Math.floor(v / step) * step;
-}
-async function getAmountStep(symbol: string): Promise<number | undefined> {
-  try {
-    const m =
-      exchange.markets[symbol] || (await exchange.loadMarkets())[symbol];
-    if (!m) return undefined;
-    if (m.precision && typeof m.precision.amount === "number") {
-      const p = m.precision.amount; // e.g., 6 -> 0.000001
-      return Number((1 / Math.pow(10, p)).toFixed(p));
-    }
-    return m.limits?.amount?.min ?? undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-// wallet helpers
-async function getWalletBaseAmount(symbol: string): Promise<number> {
-  try {
-    const base = symbol.split("/")[0];
-    const bal = await exchange.fetchBalance();
-    const q = getBalanceTotal(bal, base);
-    return Number.isFinite(q) ? q : 0;
-  } catch {
-    return 0;
-  }
-}
-
-// =============== TELEGRAM ===============
+// ===================== TELEGRAM =====================
 async function tg(text: string) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
     console.log("TG disabled: missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID");
     return;
   }
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
-  const body = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML" };
-
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), 5000); // 5s timeout
-
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
       method: "POST",
+      signal: controller.signal,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML" }),
     });
-    clearTimeout(to);
-    if (!res.ok) {
-      const j = await res.text().catch(() => "");
-      console.error("TG send failed:", res.status, j);
-    }
-  } catch (e: any) {
-    clearTimeout(to);
+    const data = await res.json();
+    if (!data?.ok) console.error("TG send failed:", res.status, JSON.stringify(data));
+  } catch (e:any) {
     console.error("TG error:", e?.message || e);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// =============== WS TICKER (Upbit) ===============
-const WSS = "wss://api.upbit.com/websocket/v1";
+// ===================== HELPERS =====================
 function toUpbitCode(ccxtSymbol: string) {
   const [base, quote] = ccxtSymbol.split("/");
-  return `${quote}-${base}`; // KRW-BTC
+  return `${quote}-${base}`;
 }
-class UpbitTickerFeed {
-  private ws: WebSocket | null = null;
-  private latest = new Map<string, number>(); // code -> trade_price
-  private codes: string[];
-  private alive = false;
-  constructor(codes: string[]) {
-    this.codes = codes;
-  }
-  get(code: string) {
-    return this.latest.get(code);
-  }
-  connect() {
-    this.ws = new WebSocket(WSS);
-    this.ws.binaryType = "arraybuffer";
-    this.ws.on("open", () => {
-      this.alive = true;
-      const sub = [
-        { ticket: `t-${Date.now()}` },
-        { type: "ticker", codes: this.codes, isOnlyRealtime: true },
-      ];
-      this.ws?.send(Buffer.from(JSON.stringify(sub)));
-    });
-    this.ws.on("message", (buf: WebSocket.RawData) => {
-      try {
-        const s = buf.toString();
-        const j = JSON.parse(s);
-        if (j && j.code && typeof j.trade_price === "number")
-          this.latest.set(j.code, j.trade_price);
-      } catch {
-        try {
-          const text = new TextDecoder().decode(buf as Buffer);
-          const j = JSON.parse(text);
-          if (j && j.code && typeof j.trade_price === "number")
-            this.latest.set(j.code, j.trade_price);
-        } catch {}
-      }
-    });
-    const ping = setInterval(() => {
-      if (this.alive) {
-        try {
-          this.ws?.ping();
-        } catch {}
-      }
-    }, 15000);
-    this.ws.on("close", () => {
-      this.alive = false;
-      clearInterval(ping);
-      setTimeout(() => this.connect(), 2000);
-    });
-    this.ws.on("error", () => {
-      this.alive = false;
-      clearInterval(ping);
-      try {
-        this.ws?.close();
-      } catch {}
-    });
+function sleep(ms:number){ return new Promise(r=>setTimeout(r,ms)); }
+
+function safeWalletQty(balance: any, base: string): number {
+  const byKey = (obj: any, k: string) => (obj && Number(obj[k])) || 0;
+  const total = byKey(balance?.total, base) || byKey(balance?.total, base.toUpperCase()) || byKey(balance?.total, base.toLowerCase());
+  const free  = byKey(balance?.free,  base) || byKey(balance?.free,  base.toUpperCase()) || byKey(balance?.free,  base.toLowerCase());
+  const used  = byKey(balance?.used,  base) || byKey(balance?.used,  base.toUpperCase()) || byKey(balance?.used,  base.toLowerCase());
+  const qty = total > 0 ? total : free + used;
+  return qty > 0 ? qty : 0;
+}
+
+function nowSeoulHour(): number {
+  const kst = new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul", hour12: false });
+  const d = new Date(kst);
+  return d.getHours();
+}
+
+function inQuietHours(): boolean {
+  const h = nowSeoulHour();
+  if (QUIET_HOUR_START <= QUIET_HOUR_END) {
+    return h >= QUIET_HOUR_START && h < QUIET_HOUR_END;
+  } else {
+    // 예: 22~02 형태
+    return h >= QUIET_HOUR_START || h < QUIET_HOUR_END;
   }
 }
 
-// =============== EXCHANGE ===============
-const exchange = new ccxt.upbit({
-  apiKey: UPBIT_API_KEY,
-  secret: UPBIT_SECRET,
-  enableRateLimit: true,
-  options: {
-    adjustForTimeDifference: true,
-    // allow market buy by KRW cost (Upbit-specific)
-    createMarketBuyOrderRequiresPrice: false,
-  },
-});
-
-// =============== STATE ===============
-type Pos = {
-  entry: number;
-  size: number; // 내부 추적 수량
-  invested: number; // KRW
-  peak: number;
-  tookTP1: boolean;
-  openedAt: number;
-  bePrice?: number;
-};
-const positions = new Map<string, Pos>();
-const tradesToday = new Map<string, number>();
-let paused = false;
-
-function allocKRW() {
-  return Math.floor(BASE_CAPITAL_KRW * POS_PCT);
+function floorToStep(v:number, step:number){
+  if (!step || step<=0) return v;
+  return Math.floor(v/step)*step;
 }
-function canEnter(symbol: string) {
-  if (paused) return false;
-  const h = hourKST();
-  const quiet =
-    QUIET_HOUR_START <= QUIET_HOUR_END
-      ? h >= QUIET_HOUR_START && h < QUIET_HOUR_END
-      : h >= QUIET_HOUR_START || h < QUIET_HOUR_END;
-  if (quiet) return false;
-  if (positions.size >= MAX_CONCURRENT_POSITIONS) return false;
-  const n = tradesToday.get(symbol) || 0;
-  if (n >= MAX_TRADES_PER_DAY) return false;
-  return true;
-}
-function incTrade(symbol: string) {
-  tradesToday.set(symbol, (tradesToday.get(symbol) || 0) + 1);
+function getMarketInfo(symbol:string){
+  const m = exchange.markets?.[symbol];
+  return m || {};
 }
 
-// =============== INDICATORS ===============
-function ema(values: number[], period: number) {
-  return EMA.calculate({ values, period });
+// 캔들/지표
+async function fetchCandles(symbol:string, tf:string, limit=200){
+  try{
+    return await exchange.fetchOHLCV(symbol, tf, undefined, limit);
+  }catch(e){ return []; }
 }
-function macdHist(values: number[]) {
-  const r = MACD.calculate({
-    values,
-    fastPeriod: MACD_FAST,
-    slowPeriod: MACD_SLOW,
-    signalPeriod: MACD_SIGNAL,
-    SimpleMAOscillator: false,
-    SimpleMASignal: false,
-  });
-  if (!r.length) return 0;
-  const last = r[r.length - 1];
-  const h =
-    last && typeof last.histogram === "number" ? (last.histogram as number) : 0;
-  return h;
-}
-function regimeOK(closes: number[]) {
-  if (!USE_REGIME_FILTER) return true;
-  const ef = ema(closes, REGIME_EMA_FAST);
-  const es = ema(closes, REGIME_EMA_SLOW);
-  if (!ef.length || !es.length) return false;
-  const lastFast = ef[ef.length - 1]!;
-  const lastSlow = es[ef.length - 1]!;
-  if (!(lastFast > lastSlow)) return false;
-  if (USE_MACD_CONFIRM && !(macdHist(closes) > 0)) return false;
-  return true;
-}
-function breakoutOK(ohlcv: OHLCVRow[]) {
-  const n = ohlcv.length;
-  if (n < BREAKOUT_LOOKBACK + 2) return false;
-  const highs = ohlcv.map((r) => r[2]);
-  const last = ohlcv[n - 1]!;
-  const priorSlice = highs.slice(n - 1 - BREAKOUT_LOOKBACK, n - 1);
-  if (!priorSlice.length) return false;
-  const priorHigh = Math.max(...priorSlice);
-  const tol = priorHigh * (BREAKOUT_TOL_BPS / 10000);
-  const closeOK = last[4] >= priorHigh - tol;
-  const highOK = USE_HIGH_BREAKOUT ? last[2] >= priorHigh - tol : false;
-  return closeOK || highOK;
-}
-
-// =============== ORDERS ===============
-async function marketBuy(symbol: string, krw: number, pxGuide: number) {
-  if (krw < LIVE_MIN_ORDER_KRW)
-    return { ok: false, reason: "below-min" as const };
-  if (MODE === "paper" || KILL_SWITCH)
-    return { ok: true, paper: true, amount: krw / pxGuide };
-
-  try {
-    // ✅ Upbit/ccxt: amount 자리에 "지출할 KRW"를 넣는다 (price 생략)
-    const o = await exchange.createOrder(symbol, "market", "buy", krw);
-    const filledAmount = (o as any).amount ?? krw / pxGuide; // 체결된 베이스 수량
-    return { ok: true, id: o.id, amount: filledAmount };
-  } catch (e: any) {
-    // 폴백: 견적가로 수량을 계산해 시도
-    try {
-      const qty = krw / pxGuide;
-      const o2 = await exchange.createOrder(symbol, "market", "buy", qty);
-      return { ok: true, id: o2.id, amount: (o2 as any).amount ?? qty };
-    } catch (e2: any) {
-      return { ok: false, reason: e2?.message || e?.message || "buy-failed" };
-    }
+function ema(values:number[], period:number): number[]{
+  const k = 2/(period+1);
+  const out:number[]=[];
+  let emaPrev = values[0];
+  out.push(emaPrev);
+  for(let i=1;i<values.length;i++){
+    const e = values[i]*k + emaPrev*(1-k);
+    out.push(e); emaPrev=e;
   }
+  return out;
 }
+function last<T>(arr:T[], n=1){ return arr.slice(-n); }
 
-async function marketSell(symbol: string, amount: number) {
-  if (amount <= 0) return { ok: false, reason: "zero-amount" as const };
-  if (MODE === "paper" || KILL_SWITCH) return { ok: true, paper: true };
-  try {
-    const step = await getAmountStep(symbol);
-    const amt = floorToPrecision(amount, step);
-    if (amt <= 0)
-      return { ok: false, reason: "precision-trim-to-zero" as const };
-    const o = await exchange.createOrder(symbol, "market", "sell", amt);
-    return { ok: true, id: o.id };
-  } catch (e: any) {
-    return { ok: false, reason: e?.message || "sell-failed" };
-  }
-}
+// ===================== SYNC (지갑↔포지션) =====================
+const _noWalletStrike: Map<string, number> = new Map();
+let _syncLock = false;
 
-async function reconcile(symbol: string) {
-  try {
-    const open = await exchange.fetchOpenOrders(symbol);
-    if (open.length) await tg(`⏳ 미체결 주문 감지: ${symbol} x${open.length}`);
-  } catch {}
-}
-
-// =============== RUNNER ===============
-async function runner(symbol: string, feed: UpbitTickerFeed) {
-  await tg(`▶️ 시작: ${symbol} | MODE=${MODE} | paused=${paused}`);
-  while (true) {
-    try {
-      await reconcile(symbol);
-
-      // Candles
-      const raw = await exchange.fetchOHLCV(symbol, TF, undefined, LOOKBACK);
-      const ohlcv = normalizeOHLCV(raw);
-      if (!ohlcv.length) {
-        await sleep(3000);
-        continue;
-      }
-
-      const closes = ohlcv.map((r) => r[4]);
-      const last = ohlcv[ohlcv.length - 1]!;
-      const lastPx = last[4];
-
-      // Price
-      const code = toUpbitCode(symbol);
-      const wsPx = feed.get(code) ?? lastPx;
-
-      const pos = positions.get(symbol);
-
-      if (pos) {
-        // ---- TP ladder ----
-        if (!pos.tookTP1 && wsPx >= pos.entry * (1 + TP1)) {
-          const step = await getAmountStep(symbol);
-          const wallet = await getWalletBaseAmount(symbol);
-          let target = Math.min(pos.size, wallet) * 0.3;
-          let amt = floorToPrecision(target, step);
-
-          if (amt <= 0 || amt * wsPx < LIVE_MIN_ORDER_KRW) {
-            await tg(
-              `⚠️ TP1 스킵 ${symbol} | 최소금액/정밀도/잔고 미달 (amt≈${amt.toFixed(
-                8
-              )}, KRW≈${Math.round(amt * wsPx)}, wallet≈${wallet.toFixed(6)})`
-            );
-          } else {
-            const r = await marketSell(symbol, amt);
-            if (r.ok) {
-              pos.size = Math.max(0, pos.size - amt);
-              pos.tookTP1 = true;
-              if (USE_BEP_AFTER_TP1)
-                pos.bePrice = pos.entry * (1 + BEP_OFFSET_BPS / 10000);
-              await tg(
-                `🟢 TP1 ${symbol} | +${(TP1 * 100).toFixed(2)}% | ${amt.toFixed(
-                  6
-                )} 청산 | 남은 pos≈${pos.size.toFixed(6)}`
-              );
-            } else {
-              await tg(
-                `❗ TP1 매도 실패 ${symbol} | ${
-                  r.reason || "unknown"
-                } (보유 유지)`
-              );
-            }
-          }
-        } else if (wsPx >= pos.entry * (1 + TP2)) {
-          const step = await getAmountStep(symbol);
-          const wallet = await getWalletBaseAmount(symbol);
-          let target = Math.min(pos.size, wallet) * 0.3;
-          let amt = floorToPrecision(target, step);
-
-          if (amt <= 0 || amt * wsPx < LIVE_MIN_ORDER_KRW) {
-            await tg(
-              `⚠️ TP2 스킵 ${symbol} | 최소금액/정밀도/잔고 미달 (amt≈${amt.toFixed(
-                8
-              )}, KRW≈${Math.round(amt * wsPx)}, wallet≈${wallet.toFixed(6)})`
-            );
-          } else {
-            const r = await marketSell(symbol, amt);
-            if (r.ok) {
-              pos.size = Math.max(0, pos.size - amt);
-              await tg(
-                `🟢 TP2 ${symbol} | +${(TP2 * 100).toFixed(2)}% | ${amt.toFixed(
-                  6
-                )} 청산 | 남은 pos≈${pos.size.toFixed(6)}`
-              );
-            } else {
-              await tg(
-                `❗ TP2 매도 실패 ${symbol} | ${
-                  r.reason || "unknown"
-                } (보유 유지)`
-              );
-            }
-          }
-        }
-
-        // ---- trailing & stops (+ force-exit) ----
-        pos.peak = Math.max(pos.peak, wsPx);
-        const trailLine = pos.peak * (1 + TRAIL);
-        const hardSL = pos.entry * (1 + STOP_LOSS);
-        const dynSL = pos.bePrice ?? hardSL;
-        const stopLine = Math.max(dynSL, trailLine);
-
-        const ddBps = Math.round(bps(pos.entry, wsPx)); // 음수면 손실
-        const forceExit = FORCE_EXIT_DD_BPS !== 0 && ddBps <= FORCE_EXIT_DD_BPS;
-
-        if (forceExit || wsPx <= stopLine || pos.size <= 0) {
-          const step = await getAmountStep(symbol);
-          const wallet = await getWalletBaseAmount(symbol);
-          let amt = floorToPrecision(Math.min(pos.size, wallet), step);
-
-          if (forceExit) {
-            await tg(
-              `⛔ FORCE-EXIT ${symbol} | DD=${(ddBps / 100).toFixed(
-                2
-              )}% | pos≈${pos.size.toFixed(6)} wallet≈${wallet.toFixed(6)}`
-            );
-          }
-
-          if (amt <= 0) {
-            await tg(
-              `⚠️ EXIT 보류 ${symbol} | 정밀도/잔고 보정 후 0 (pos≈${pos.size.toFixed(
-                6
-              )} wallet≈${wallet.toFixed(6)})`
-            );
-            await sleep(LOOP_DELAY_MS);
-            continue;
-          }
-          if (amt * wsPx < LIVE_MIN_ORDER_KRW) {
-            await tg(
-              `⚠️ EXIT 불가(먼지) ${symbol} | 가치≈${Math.round(
-                amt * wsPx
-              )} KRW < ${LIVE_MIN_ORDER_KRW} (pos≈${pos.size.toFixed(
-                6
-              )} wallet≈${wallet.toFixed(6)})`
-            );
-            await sleep(LOOP_DELAY_MS);
-            continue;
-          }
-
-          const r = await marketSell(symbol, amt);
-          if (r.ok) {
-            const pnl = (wsPx / pos.entry - 1) * 100;
-            await tg(
-              `🔴 EXIT ${symbol} | ${Math.round(pos.entry)} → ${Math.round(
-                wsPx
-              )} | ${pnl.toFixed(2)}% | amt=${amt.toFixed(6)}`
-            );
-            pos.size = Math.max(0, pos.size - amt);
-            if (pos.size <= (step || 0)) positions.delete(symbol);
-          } else {
-            await tg(
-              `❗ EXIT 매도 실패 ${symbol} | ${
-                r.reason || "unknown"
-              } | 재시도 예정 (pos≈${pos.size.toFixed(
-                6
-              )} wallet≈${wallet.toFixed(6)})`
-            );
-          }
-
-          await sleep(LOOP_DELAY_MS);
-          continue;
-        }
-
-        await sleep(LOOP_DELAY_MS);
-        continue;
-      }
-
-      // ---- Entry ----
-      if (!canEnter(symbol)) {
-        await sleep(LOOP_DELAY_MS);
-        continue;
-      }
-      const okRegime = regimeOK(closes);
-      const okBreakout = breakoutOK(ohlcv);
-      if (!(okRegime && okBreakout)) {
-        await sleep(LOOP_DELAY_MS);
-        continue;
-      }
-
-      // 보유 중이면 신규 매수 스킵
-      if (ENTRY_SKIP_IF_WALLET) {
-        const wallet = await getWalletBaseAmount(symbol);
-        const walletKrw = wallet * wsPx;
-        if (walletKrw >= ENTRY_WALLET_MIN_KRW) {
-          await tg(
-            `⏸️ 보유중 진입 스킵 ${symbol} | 지갑≈${wallet.toFixed(
-              6
-            )} (${Math.round(walletKrw)} KRW)`
-          );
-          await sleep(LOOP_DELAY_MS);
-          continue;
-        }
-      }
-
-      const drift = Math.abs(bps(lastPx, wsPx));
-      if (drift > ENTRY_SLIPPAGE_BPS) {
-        await sleep(LOOP_DELAY_MS);
-        continue;
-      }
-
-      const alloc = allocKRW();
-      if (alloc < LIVE_MIN_ORDER_KRW) {
-        await sleep(LOOP_DELAY_MS);
-        continue;
-      }
-
-      const buy = await marketBuy(symbol, alloc, wsPx);
-      if (!buy.ok) {
-        await tg(`⚠️ BUY 실패 ${symbol} | ${buy.reason}`);
-        await sleep(LOOP_DELAY_MS);
-        continue;
-      }
-
-      const size =
-        MODE === "paper" || KILL_SWITCH
-          ? alloc / wsPx
-          : (buy as any).amount ?? alloc / wsPx;
-      const p: Pos = {
-        entry: wsPx,
-        size,
-        invested: alloc,
-        peak: wsPx,
-        tookTP1: false,
-        openedAt: Date.now(),
-      };
-      positions.set(symbol, p);
-      incTrade(symbol);
-      await tg(
-        `🟩 ENTRY ${symbol} | 진입 ${Math.round(
-          p.entry
-        )} | 수량 ${p.size.toFixed(6)} | 배분 ${alloc.toLocaleString()} KRW`
-      );
-
-      await sleep(LOOP_DELAY_MS);
-    } catch (e: any) {
-      await tg(`⚠️ 루프 에러 ${symbol}: ${e?.message || e}`);
-      await sleep(4000);
-    }
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-/**
- * 시작 시 1회: 지갑 잔고를 현재 가격으로 환산하여 포지션 맵(positions)에 채워 넣는다.
- * - DUST_KRW_MIN 미만 금액은 무시(먼지)
- * - 이미 포지션이 있는 심볼은 건너뜀(중복 방지)
- * - 동기화된 심볼마다 텔레그램에 보고
- */
-async function syncPositionsFromWallet(
-  symbols: string[],
-  feed: UpbitTickerFeed
-) {
+async function syncPositionsFromWalletOnce(symbols: string[], feed: UpbitTickerFeed) {
   try {
     const bal = await exchange.fetchBalance();
-    for (const s of symbols) {
-      if (positions.has(s)) continue; // 이미 포지션이 있으면 스킵
-      const base = s.split("/")[0];
-      const code = toUpbitCode(s);
-      const lastPx = feed.get(code);
-      if (!lastPx || lastPx <= 0) continue; // 아직 WS 틱을 못 받았으면 스킵
-
-      const qty = getBalanceTotal(bal, base); // 지갑에 있는 베이스 수량
-      if (!Number.isFinite(qty) || qty <= 0) continue;
-
-      const krw = qty * lastPx;
-      if (krw < DUST_KRW_MIN) continue; // 먼지 잔고는 무시
-
-      const p: Pos = {
-        entry: lastPx,
-        size: qty,
-        invested: krw,
-        peak: lastPx,
-        tookTP1: false,
-        openedAt: Date.now(),
-      };
-      positions.set(s, p);
-      await tg(
-        `🔄 잔고 동기화: ${s} | 수량≈${qty.toFixed(6)} | KRW≈${Math.round(
-          krw
-        )} (entry≈${Math.round(lastPx)})`
-      );
-    }
-  } catch (e: any) {
-    await tg(`⚠️ 잔고 동기화 실패: ${e?.message || e}`);
-  }
-}
-
-// ───────────────── 잔고 ←→ 포지션 동기화 공통 파라미터 ─────────────────
-const SYNC_MIN_KRW = Number(process.env.SYNC_MIN_KRW ?? 3000); // 먼지 기준
-const SYNC_TOLERANCE_BPS = Number(process.env.SYNC_TOLERANCE_BPS ?? 50); // 0.5% 기본
-const SYNC_POS_INTERVAL_MIN = Number(process.env.SYNC_POS_INTERVAL_MIN ?? 15); // 15분 기본
-
-let _syncLock = false; // 동기화 중복 실행 방지
-
-/**
- * 시작/주기: 지갑 잔고를 현재 가격으로 환산하여
- * 1) 포지션이 없는데 잔고가 있으면 → 새 포지션으로 "등록"
- * 2) 포지션이 있는데 잔고가 거의 없으면 → 포지션 "제거"(수동 청산 간주)
- * 3) 둘 다 있는데 수량 차이가 크면 → 포지션 "사이즈 보정"
- *    - entry는 보수적으로 유지(알 수 없는 체결가). invested/peak만 현재가로 재계산
- */
-async function reconcilePositionsFromWallet(
-  symbols: string[],
-  feed: UpbitTickerFeed
-) {
-  if (_syncLock) return;
-  _syncLock = true;
-
-  try {
-    const bal = await exchange.fetchBalance();
-
-    for (const s of symbols) {
-      const base = s.split("/")[0];
-      const code = toUpbitCode(s);
-      const lastPx = feed.get(code);
-      if (!lastPx || lastPx <= 0) continue;
-
-      const walletQty = getBalanceTotal(bal, base);
-      const walletKRW = walletQty * lastPx;
-      const hasWallet = walletKRW >= SYNC_MIN_KRW;
-      const pos = positions.get(s);
-
-      if (!pos && hasWallet) {
-        // 케이스 1: 포지션 없음 + 잔고 있음 → 신규 등록
-        const newPos: Pos = {
-          entry: lastPx,
-          size: walletQty,
-          invested: walletKRW,
-          peak: lastPx,
-          tookTP1: false,
-          openedAt: Date.now(),
-        };
-        positions.set(s, newPos);
-        await tg(
-          `🔄 동기화: ${s} 신규등록 | qty≈${walletQty.toFixed(
-            6
-          )} | KRW≈${Math.round(walletKRW)} (entry≈${Math.round(lastPx)})`
-        );
-        continue;
-      }
-
-      if (pos && !hasWallet) {
-        // 케이스 2: 포지션 있음 + 잔고 없음 → 포지션 제거(수동 청산 간주)
-        positions.delete(s);
-        await tg(`🔄 동기화: ${s} 제거(지갑 잔량 없음으로 판단)`);
-        continue;
-      }
-
-      if (pos && hasWallet) {
-        // 케이스 3: 둘 다 있음 → 사이즈 차이 허용치 검사
-        const diffAbs = Math.abs(walletQty - pos.size);
-        const diffPct = pos.size > 0 ? (diffAbs / pos.size) * 10000 : 10000; // bps
-        if (diffPct > SYNC_TOLERANCE_BPS) {
-          // 사이즈만 보정(알 수 없는 평균단가 문제로 entry는 유지)
-          pos.size = walletQty;
-          pos.invested = walletQty * lastPx;
-          pos.peak = Math.max(pos.peak ?? lastPx, lastPx);
-          positions.set(s, pos);
-          await tg(
-            `🔄 동기화: ${s} 사이즈 보정 | qty≈${walletQty.toFixed(
-              6
-            )} | KRW≈${Math.round(pos.invested)} (entry=keep ${Math.round(
-              pos.entry
-            )})`
-          );
-        }
-      }
-    }
-  } catch (e: any) {
-    await tg(`⚠️ 동기화 오류: ${e?.message || e}`);
-  } finally {
-    _syncLock = false;
-  }
-}
-
-/** 시작 시 1회: 포지션이 비어있는 심볼만 잔고→포지션 등록(먼지 제외) */
-async function syncPositionsFromWalletOnce(
-  symbols: string[],
-  feed: UpbitTickerFeed
-) {
-  try {
-    const bal = await exchange.fetchBalance();
-
     for (const s of symbols) {
       if (positions.has(s)) continue;
       const base = s.split("/")[0];
@@ -803,71 +170,329 @@ async function syncPositionsFromWalletOnce(
       const lastPx = feed.get(code);
       if (!lastPx || lastPx <= 0) continue;
 
-      const qty = getBalanceTotal(bal, base);
+      const qty = safeWalletQty(bal, base);
       const krw = qty * lastPx;
       if (krw < SYNC_MIN_KRW) continue;
 
-      const p: Pos = {
-        entry: lastPx,
-        size: qty,
-        invested: krw,
-        peak: lastPx,
-        tookTP1: false,
-        openedAt: Date.now(),
-      };
-      positions.set(s, p);
-      await tg(
-        `🔄 동기화: ${s} | qty≈${qty.toFixed(6)} | KRW≈${Math.round(
-          krw
-        )} (entry≈${Math.round(lastPx)})`
-      );
+      positions.set(s, { entry: lastPx, size: qty, invested: krw, peak: lastPx, tookTP1: false, openedAt: Date.now() });
+      await tg(`🔄 동기화: ${s} | qty≈${qty.toFixed(6)} | KRW≈${Math.round(krw)} (entry≈${Math.round(lastPx)})`);
     }
-  } catch (e: any) {
+  } catch (e:any) {
     await tg(`⚠️ 초기 동기화 실패: ${e?.message || e}`);
   }
 }
 
-// =============== MAIN ===============
+async function reconcilePositionsFromWallet(symbols: string[], feed: UpbitTickerFeed) {
+  if (_syncLock) return;
+  _syncLock = true;
+  try {
+    const bal = await exchange.fetchBalance();
+    for (const s of symbols) {
+      const base = s.split("/")[0];
+      const code = toUpbitCode(s);
+      const lastPx = feed.get(code);
+      if (!lastPx || lastPx <= 0) continue;
+
+      const walletQty = safeWalletQty(bal, base);
+      const walletKRW = walletQty * lastPx;
+      const hasWallet = walletKRW >= SYNC_MIN_KRW;
+
+      const pos = positions.get(s);
+
+      if (!pos && hasWallet) {
+        positions.set(s, { entry: lastPx, size: walletQty, invested: walletKRW, peak: lastPx, tookTP1: false, openedAt: Date.now() });
+        _noWalletStrike.delete(s);
+        await tg(`🔄 동기화: ${s} 신규등록 | qty≈${walletQty.toFixed(6)} | KRW≈${Math.round(walletKRW)} (entry≈${Math.round(lastPx)})`);
+        continue;
+      }
+      if (pos && !hasWallet) {
+        const n = (_noWalletStrike.get(s) || 0) + 1;
+        _noWalletStrike.set(s, n);
+        if (n >= REMOVE_STRIKE_REQUIRED) {
+          positions.delete(s);
+          _noWalletStrike.delete(s);
+          await tg(`🔄 동기화: ${s} 제거(지갑 잔량 없음 ${n}회 연속)`);
+        } else {
+          await tg(`⚠️ 동기화: ${s} 지갑 잔량 없음 1회 감지(보류)`);
+        }
+        continue;
+      }
+      if (pos && hasWallet) {
+        _noWalletStrike.delete(s);
+        const diffAbs = Math.abs(walletQty - pos.size);
+        const diffPctBps = pos.size > 0 ? (diffAbs / pos.size) * 10000 : 0;
+        if (diffPctBps > SYNC_TOLERANCE_BPS) {
+          pos.size = walletQty;
+          pos.invested = walletQty * lastPx;
+          pos.peak = Math.max(pos.peak ?? lastPx, lastPx);
+          positions.set(s, pos);
+          await tg(`🔄 동기화: ${s} 사이즈 보정 | qty≈${walletQty.toFixed(6)} | KRW≈${Math.round(pos.invested)} (entry 유지 ${Math.round(pos.entry)})`);
+        }
+      }
+    }
+  } catch (e:any) {
+    await tg(`⚠️ 동기화 오류: ${e?.message || e}`);
+  } finally {
+    _syncLock = false;
+  }
+}
+
+// ===================== ORDER HELPERS =====================
+function todayStrKST(){
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul"})).toISOString().slice(0,10);
+}
+function incTradeCount(sym:string){
+  const t = tradeCounter.get(sym);
+  const today = todayStrKST();
+  if (!t || t.day !== today) {
+    tradeCounter.set(sym, { day: today, count: 1 });
+    return 1;
+  } else {
+    t.count += 1;
+    tradeCounter.set(sym, t);
+    return t.count;
+  }
+}
+function getTradeCount(sym:string){
+  const t = tradeCounter.get(sym);
+  const today = todayStrKST();
+  if (!t || t.day !== today) return 0;
+  return t.count;
+}
+
+async function marketBuy(symbol:string, lastPx:number){
+  // 배팅 금액
+  const budgetKRW = Math.max(LIVE_MIN_ORDER_KRW, Math.floor(BASE_CAPITAL_KRW * POS_PCT));
+  const amount = budgetKRW / lastPx;
+
+  // 스텝/정밀도
+  await exchange.loadMarkets();
+  const mi = getMarketInfo(symbol);
+  const step = mi?.precision?.amount ? Math.pow(10, -mi.precision.amount) : 0; // upbit는 정밀도 표기가 다를 수 있음
+  const amt = step ? floorToStep(amount, step) : amount;
+
+  if (budgetKRW < LIVE_MIN_ORDER_KRW || amt <= 0) return { ok:false, reason:"amount-too-small" };
+
+  if (MODE === "paper") return { ok:true, paper:true, amt };
+
+  try{
+    const o = await exchange.createOrder(symbol, "market", "buy", amt);
+    return { ok:true, order:o, amt };
+  }catch(e:any){
+    return { ok:false, reason:e?.message || "buy-failed" };
+  }
+}
+
+async function marketSell(symbol:string, amt:number){
+  if (amt <= 0) return { ok:false, reason:"zero-amt" };
+  if (MODE === "paper") return { ok:true, paper:true, amt };
+  try{
+    const o = await exchange.createOrder(symbol, "market", "sell", amt);
+    return { ok:true, order:o };
+  }catch(e:any){
+    return { ok:false, reason:e?.message || "sell-failed" };
+  }
+}
+
+// ===================== STRATEGY RUNNER =====================
+async function runner(symbol: string, feed: UpbitTickerFeed) {
+  const code = toUpbitCode(symbol);
+  await tg(`▶️ 시작: ${symbol} | MODE=${MODE} | paused=false`);
+
+  let lastBarTs = 0;
+
+  for (;;) {
+    try{
+      // 조용시간엔 신규 진입만 막고, 보유포지션은 관리(익절/손절) 계속
+      const quiet = inQuietHours();
+
+      // 실시간 가격
+      const lastPx = feed.get(code);
+      if (!lastPx) { await sleep(1000); continue; }
+
+      // 캔들 최신화 (봉이 바뀌었을 때만 계산 비용)
+      const candles = await fetchCandles(symbol, TF, 120);
+      if (!candles.length){ await sleep(1000); continue; }
+      const [tOpen, tHigh, tLow, tClose] = last(candles,1)[0].slice(0,5);
+      if (tOpen === lastBarTs && lastPx === tClose) {
+        // 같은 봉/같은 가격이면 간격만 둔다
+        await sleep(1000);
+      } else {
+        lastBarTs = tOpen;
+
+        const closes = candles.map(c => c[4]);
+        const emaFast = ema(closes, Math.min(REGIME_EMA_FAST, closes.length));
+        const emaSlow = ema(closes, Math.min(REGIME_EMA_SLOW, closes.length));
+        const fast = last(emaFast,1)[0];
+        const slow = last(emaSlow,1)[0];
+
+        // 최근 N봉 고가
+        const highs = candles.map(c => c[2]);
+        const hh = Math.max(...highs.slice(-BREAKOUT_LOOKBACK - 1, -1)); // 직전 N봉 고가
+
+        const pos = positions.get(symbol);
+        const inPos = !!pos;
+
+        // ====== 보유 포지션 관리(우선) ======
+        if (inPos) {
+          // 트레일링/TP/손절 관리
+          if (!pos.peak || lastPx > pos.peak) pos.peak = lastPx;
+
+          const pnlPct = (lastPx - pos.entry) / pos.entry;
+
+          // TP1: 절반 익절 -> BEP 보호
+          if (!pos.tookTP1 && pnlPct >= TP1) {
+            const sellAmt = pos.size * 0.5;
+            const r = await marketSell(symbol, sellAmt);
+            if (r.ok) {
+              pos.size -= sellAmt;
+              pos.invested = pos.size * lastPx;
+              pos.tookTP1 = true;
+              if (USE_BEP_AFTER_TP1) pos.entry = Math.min(pos.entry, lastPx); // BEP 상향(보수적으로 진입가 유지 또는 진입가로 이동)
+              positions.set(symbol, pos);
+              await tg(`✅ TP1: ${symbol} 50% 익절 | 나머지=${pos.size.toFixed(6)}`);
+            } else {
+              await tg(`❗ TP1 실패: ${symbol} | ${r.reason}`);
+            }
+          }
+
+          // TP2: 전량 익절
+          if (pnlPct >= TP2) {
+            const r = await marketSell(symbol, pos.size);
+            if (r.ok) {
+              positions.delete(symbol);
+              await tg(`🎯 TP2: ${symbol} 전량 익절`);
+            } else {
+              await tg(`❗ TP2 실패: ${symbol} | ${r.reason}`);
+            }
+          } else {
+            // 트레일링 스탑: peak 대비 하락폭이 |TRAIL| 이상이면 청산
+            if (pos.peak && (lastPx - pos.peak) / pos.peak <= TRAIL) {
+              const r = await marketSell(symbol, pos.size);
+              if (r.ok) {
+                positions.delete(symbol);
+                await tg(`🛑 트레일 스탑: ${symbol} 청산`);
+              } else {
+                await tg(`❗ 트레일 실패: ${symbol} | ${r.reason}`);
+              }
+            }
+          }
+        }
+
+        // ====== 신규 진입 조건 ======
+        if (!inPos && !quiet) {
+          // 동시 포지션/일일 거래 제한
+          if (Array.from(positions.keys()).length >= MAX_CONCURRENT_POS) {
+            // 용량 초과 → 스킵
+          } else if (getTradeCount(symbol) >= MAX_TRADES_PER_DAY) {
+            // 일일 횟수 초과 → 스킵
+          } else {
+            // 레짐 필터: 추세 우상향일 때만
+            const regimeOk = !USE_REGIME_FILTER || fast >= slow;
+            // 돌파: 현재가가 직전 N봉 고가를 소폭 상향 돌파
+            const tol = hh * (BREAKOUT_TOL_BPS / 10000);
+            const breakoutOk = lastPx >= hh + tol;
+
+            if (regimeOk && breakoutOk) {
+              // 슬리피지: 최근 종가 대비 급등 진입 방지
+              const ref = tClose || lastPx;
+              const slip = (lastPx - ref) / ref * 10000;
+              if (slip <= ENTRY_SLIPPAGE_BPS) {
+                // 매수
+                const r = await marketBuy(symbol, lastPx);
+                if (r.ok) {
+                  // 포지션 기록
+                  const size = r.paper ? (BASE_CAPITAL_KRW * POS_PCT) / lastPx : r.amt;
+                  positions.set(symbol, {
+                    entry: lastPx,
+                    size,
+                    invested: size * lastPx,
+                    peak: lastPx,
+                    tookTP1: false,
+                    openedAt: Date.now(),
+                  });
+                  incTradeCount(symbol);
+                  await tg(`🟢 진입: ${symbol} @${Math.round(lastPx)} | size≈${size.toFixed(6)}`);
+                } else {
+                  await tg(`❗ 진입 실패: ${symbol} | ${r.reason}`);
+                }
+              } else {
+                await tg(`⚠️ 슬리피지 초과로 진입 취소: ${symbol} slip=${slip.toFixed(1)}bps`);
+              }
+            }
+          }
+        }
+
+        // 루프 간격
+        await sleep(1500);
+      }
+    }catch(e:any){
+      await tg(`❗ runner error(${symbol}): ${e?.message || e}`);
+      await sleep(2000);
+    }
+  }
+}
+
+// ===================== MAIN =====================
 async function main() {
   const symbols = TRADE_COINS.length ? TRADE_COINS : [SYMBOL_CCXT];
   const codes = symbols.map(toUpbitCode);
+
+  // 이전 상태 복구(선택)
+  try {
+    const prev = await loadState();
+    if (prev?.positions) {
+      for (const [k, v] of Object.entries(prev.positions as Record<string, Pos>)) {
+        positions.set(k, v);
+      }
+    }
+  } catch {}
+
   const feed = new UpbitTickerFeed(codes);
   feed.connect();
 
-  console.log(
-    `BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`
-  );
-  await tg(
-    `🚀 BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`
-  );
+  console.log(`BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`);
+  await tg(`🚀 BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`);
 
-  // ✅ 시작 시 1회: 포지션 비어있는 심볼만 등록(먼지 제외)
+  // 시작 1회 동기화
   await syncPositionsFromWalletOnce(symbols, feed);
 
-  // 이후 실행 루프(전략 러너) 시작
-  symbols.forEach((s) => {
-    runner(s, feed);
+  // 전략 루프 시작
+  symbols.forEach(s => {
+    runner(s, feed).catch(e => tg(`❗ runner error(${s}): ${e?.message || e}`));
   });
 
-  // ✅ 주기적 재동기화(지갑↔포지션 불일치 자동 조정)
+  // 주기 동기화(지연 시작)
   const syncMs = Math.max(1, SYNC_POS_INTERVAL_MIN) * 60 * 1000;
-  setInterval(() => {
-    reconcilePositionsFromWallet(symbols, feed).catch((e) =>
-      tg(`⚠️ 주기 동기화 오류: ${e?.message || e}`)
-    );
+  setTimeout(() => {
+    reconcilePositionsFromWallet(symbols, feed).catch(e => tg(`⚠️ 주기 동기화 오류: ${e?.message || e}`));
+    setInterval(() => {
+      reconcilePositionsFromWallet(symbols, feed).catch(e => tg(`⚠️ 주기 동기화 오류: ${e?.message || e}`));
+    }, syncMs);
   }, syncMs);
 
   process.on("SIGINT", async () => {
     await tg("👋 종료(SIGINT)");
+    try {
+      const out: Record<string, Pos> = {};
+      positions.forEach((v,k)=>out[k]=v);
+      await saveState({ positions: out, ts: Date.now() });
+    }catch{}
     process.exit(0);
   });
   process.on("SIGTERM", async () => {
     await tg("👋 종료(SIGTERM)");
+    try {
+      const out: Record<string, Pos> = {};
+      positions.forEach((v,k)=>out[k]=v);
+      await saveState({ positions: out, ts: Date.now() });
+    }catch{}
     process.exit(0);
   });
 }
 
-main().catch(async (e) => {
-  await tg(`❌ FATAL: ${e?.message || e}`);
+main().catch(async e => {
+  console.error(e);
+  await tg(`💥 FATAL: ${e?.message || e}`);
   process.exit(1);
 });
