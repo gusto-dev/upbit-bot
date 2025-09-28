@@ -700,6 +700,133 @@ async function syncPositionsFromWallet(
   }
 }
 
+// ───────────────── 잔고 ←→ 포지션 동기화 공통 파라미터 ─────────────────
+const SYNC_MIN_KRW = Number(process.env.SYNC_MIN_KRW ?? 3000); // 먼지 기준
+const SYNC_TOLERANCE_BPS = Number(process.env.SYNC_TOLERANCE_BPS ?? 50); // 0.5% 기본
+const SYNC_POS_INTERVAL_MIN = Number(process.env.SYNC_POS_INTERVAL_MIN ?? 15); // 15분 기본
+
+let _syncLock = false; // 동기화 중복 실행 방지
+
+/**
+ * 시작/주기: 지갑 잔고를 현재 가격으로 환산하여
+ * 1) 포지션이 없는데 잔고가 있으면 → 새 포지션으로 "등록"
+ * 2) 포지션이 있는데 잔고가 거의 없으면 → 포지션 "제거"(수동 청산 간주)
+ * 3) 둘 다 있는데 수량 차이가 크면 → 포지션 "사이즈 보정"
+ *    - entry는 보수적으로 유지(알 수 없는 체결가). invested/peak만 현재가로 재계산
+ */
+async function reconcilePositionsFromWallet(
+  symbols: string[],
+  feed: UpbitTickerFeed
+) {
+  if (_syncLock) return;
+  _syncLock = true;
+
+  try {
+    const bal = await exchange.fetchBalance();
+
+    for (const s of symbols) {
+      const base = s.split("/")[0];
+      const code = toUpbitCode(s);
+      const lastPx = feed.get(code);
+      if (!lastPx || lastPx <= 0) continue;
+
+      const walletQty = getBalanceTotal(bal, base);
+      const walletKRW = walletQty * lastPx;
+      const hasWallet = walletKRW >= SYNC_MIN_KRW;
+      const pos = positions.get(s);
+
+      if (!pos && hasWallet) {
+        // 케이스 1: 포지션 없음 + 잔고 있음 → 신규 등록
+        const newPos: Pos = {
+          entry: lastPx,
+          size: walletQty,
+          invested: walletKRW,
+          peak: lastPx,
+          tookTP1: false,
+          openedAt: Date.now(),
+        };
+        positions.set(s, newPos);
+        await tg(
+          `🔄 동기화: ${s} 신규등록 | qty≈${walletQty.toFixed(
+            6
+          )} | KRW≈${Math.round(walletKRW)} (entry≈${Math.round(lastPx)})`
+        );
+        continue;
+      }
+
+      if (pos && !hasWallet) {
+        // 케이스 2: 포지션 있음 + 잔고 없음 → 포지션 제거(수동 청산 간주)
+        positions.delete(s);
+        await tg(`🔄 동기화: ${s} 제거(지갑 잔량 없음으로 판단)`);
+        continue;
+      }
+
+      if (pos && hasWallet) {
+        // 케이스 3: 둘 다 있음 → 사이즈 차이 허용치 검사
+        const diffAbs = Math.abs(walletQty - pos.size);
+        const diffPct = pos.size > 0 ? (diffAbs / pos.size) * 10000 : 10000; // bps
+        if (diffPct > SYNC_TOLERANCE_BPS) {
+          // 사이즈만 보정(알 수 없는 평균단가 문제로 entry는 유지)
+          pos.size = walletQty;
+          pos.invested = walletQty * lastPx;
+          pos.peak = Math.max(pos.peak ?? lastPx, lastPx);
+          positions.set(s, pos);
+          await tg(
+            `🔄 동기화: ${s} 사이즈 보정 | qty≈${walletQty.toFixed(
+              6
+            )} | KRW≈${Math.round(pos.invested)} (entry=keep ${Math.round(
+              pos.entry
+            )})`
+          );
+        }
+      }
+    }
+  } catch (e: any) {
+    await tg(`⚠️ 동기화 오류: ${e?.message || e}`);
+  } finally {
+    _syncLock = false;
+  }
+}
+
+/** 시작 시 1회: 포지션이 비어있는 심볼만 잔고→포지션 등록(먼지 제외) */
+async function syncPositionsFromWalletOnce(
+  symbols: string[],
+  feed: UpbitTickerFeed
+) {
+  try {
+    const bal = await exchange.fetchBalance();
+
+    for (const s of symbols) {
+      if (positions.has(s)) continue;
+      const base = s.split("/")[0];
+      const code = toUpbitCode(s);
+      const lastPx = feed.get(code);
+      if (!lastPx || lastPx <= 0) continue;
+
+      const qty = getBalanceTotal(bal, base);
+      const krw = qty * lastPx;
+      if (krw < SYNC_MIN_KRW) continue;
+
+      const p: Pos = {
+        entry: lastPx,
+        size: qty,
+        invested: krw,
+        peak: lastPx,
+        tookTP1: false,
+        openedAt: Date.now(),
+      };
+      positions.set(s, p);
+      await tg(
+        `🔄 동기화: ${s} | qty≈${qty.toFixed(6)} | KRW≈${Math.round(
+          krw
+        )} (entry≈${Math.round(lastPx)})`
+      );
+    }
+  } catch (e: any) {
+    await tg(`⚠️ 초기 동기화 실패: ${e?.message || e}`);
+  }
+}
+
 // =============== MAIN ===============
 async function main() {
   const symbols = TRADE_COINS.length ? TRADE_COINS : [SYMBOL_CCXT];
@@ -714,16 +841,21 @@ async function main() {
     `🚀 BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`
   );
 
-  // (선택) 시작 시 잔고-상태 불일치 경고 로직은 남겨두어도 무방하지만,
-  // 아래 동기화가 선행되면 경고가 크게 줄어듭니다.
+  // ✅ 시작 시 1회: 포지션 비어있는 심볼만 등록(먼지 제외)
+  await syncPositionsFromWalletOnce(symbols, feed);
 
-  // ✅ 추가: 지갑 잔고 → 포지션 맵 동기화 (먼지 제외)
-  await syncPositionsFromWallet(symbols, feed);
-
-  // 이후 실행 루프 시작
+  // 이후 실행 루프(전략 러너) 시작
   symbols.forEach((s) => {
     runner(s, feed);
   });
+
+  // ✅ 주기적 재동기화(지갑↔포지션 불일치 자동 조정)
+  const syncMs = Math.max(1, SYNC_POS_INTERVAL_MIN) * 60 * 1000;
+  setInterval(() => {
+    reconcilePositionsFromWallet(symbols, feed).catch((e) =>
+      tg(`⚠️ 주기 동기화 오류: ${e?.message || e}`)
+    );
+  }, syncMs);
 
   process.on("SIGINT", async () => {
     await tg("👋 종료(SIGINT)");
