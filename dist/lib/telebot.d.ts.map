@@ -1,1 +1,0 @@
-{"version":3,"file":"telebot.d.ts","sourceRoot":"","sources":["../../src/lib/telebot.ts"],"names":[],"mappings":"AAIA,qBAAa,OAAO;IACN,OAAO,CAAC,KAAK;IAAU,OAAO,CAAC,MAAM;gBAA7B,KAAK,EAAE,MAAM,EAAU,MAAM,EAAE,MAAM;IACnD,IAAI,CAAC,GAAG,EAAE,MAAM;CAcvB"}

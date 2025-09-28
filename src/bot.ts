@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 // src/bot.ts — 안정 러너 + 주기 동기화 + 텔레그램 알림 (CJS 타깃)
 
 import "dotenv/config";
@@ -6,54 +5,121 @@ import ccxt from "ccxt";
 import { UpbitTickerFeed } from "./lib/wsTicker";
 import { loadState, saveState } from "./lib/persist";
 
-// ===================== ENV =====================
+// ===================== ENV (Validated) =====================
+function num(v: any, d: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
+function bool(v: any, d: boolean) {
+  if (typeof v === "string") return v === "true" || v === "1";
+  if (typeof v === "boolean") return v;
+  return d;
+}
+function clamp(v: number, min: number, max: number) {
+  return Math.min(Math.max(v, min), max);
+}
+
 const MODE = (process.env.MODE || "live") as "live" | "paper";
 const SYMBOL_CCXT = process.env.SYMBOL_CCXT || "BTC/KRW";
 const TRADE_COINS = (process.env.TRADE_COINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
 const TF = process.env.TF || "5m";
-
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-
 const UPBIT_API_KEY = process.env.UPBIT_API_KEY || "";
 const UPBIT_SECRET = process.env.UPBIT_SECRET || "";
 
-// 안전장치/전략 파라미터
-const BASE_CAPITAL_KRW = Number(process.env.BASE_CAPITAL_KRW ?? 500000);
-const POS_PCT = Number(process.env.POS_PCT ?? 0.12);
-const LIVE_MIN_ORDER_KRW = Number(process.env.LIVE_MIN_ORDER_KRW ?? 5000);
+let BASE_CAPITAL_KRW = clamp(
+  num(process.env.BASE_CAPITAL_KRW, 500_000),
+  10_000,
+  100_000_000
+);
+let POS_PCT = clamp(num(process.env.POS_PCT, 0.12), 0.001, 1);
+let LIVE_MIN_ORDER_KRW = clamp(
+  num(process.env.LIVE_MIN_ORDER_KRW, 5000),
+  1000,
+  20_000
+);
+let ENTRY_SLIPPAGE_BPS = clamp(num(process.env.ENTRY_SLIPPAGE_BPS, 30), 1, 500);
+let BREAKOUT_LOOKBACK = clamp(num(process.env.BREAKOUT_LOOKBACK, 6), 2, 200);
+let BREAKOUT_TOL_BPS = clamp(num(process.env.BREAKOUT_TOL_BPS, 15), 0, 1000);
+const USE_REGIME_FILTER = bool(process.env.USE_REGIME_FILTER, true);
+let REGIME_EMA_FAST = clamp(num(process.env.REGIME_EMA_FAST, 20), 2, 500);
+let REGIME_EMA_SLOW = clamp(num(process.env.REGIME_EMA_SLOW, 60), 3, 1000);
+if (REGIME_EMA_FAST >= REGIME_EMA_SLOW)
+  REGIME_EMA_FAST = Math.max(2, REGIME_EMA_SLOW - 1);
+let TP1 = clamp(num(process.env.TP1, 0.012), 0.001, 0.2);
+let TP2 = clamp(num(process.env.TP2, 0.022), TP1 + 0.001, 0.5);
+let TRAIL = clamp(num(process.env.TRAIL, -0.015), -0.2, -0.001);
+const USE_BEP_AFTER_TP1 = bool(process.env.USE_BEP_AFTER_TP1, true);
+let MAX_TRADES_PER_DAY = clamp(num(process.env.MAX_TRADES_PER_DAY, 4), 1, 50);
+let MAX_CONCURRENT_POS = clamp(
+  num(process.env.MAX_CONCURRENT_POSITIONS, 3),
+  1,
+  20
+);
+let QUIET_HOUR_START = clamp(num(process.env.QUIET_HOUR_START, 2), 0, 23);
+let QUIET_HOUR_END = clamp(num(process.env.QUIET_HOUR_END, 6), 0, 23);
 
-const ENTRY_SLIPPAGE_BPS = Number(process.env.ENTRY_SLIPPAGE_BPS ?? 30);
+let SYNC_MIN_KRW = clamp(num(process.env.SYNC_MIN_KRW, 3000), 500, 1_000_000);
+let SYNC_TOLERANCE_BPS = clamp(
+  num(process.env.SYNC_TOLERANCE_BPS, 50),
+  1,
+  10_000
+);
+let SYNC_POS_INTERVAL_MIN = clamp(
+  num(process.env.SYNC_POS_INTERVAL_MIN, 15),
+  1,
+  240
+);
+let REMOVE_STRIKE_REQUIRED = clamp(
+  num(process.env.SYNC_REMOVE_STRIKE, 2),
+  1,
+  10
+);
+const STOP_LOSS_PCT = clamp(
+  num(process.env.STOP_LOSS_PCT, -0.03),
+  -0.3,
+  -0.001
+);
+const USE_DYNAMIC_STOP = bool(process.env.USE_DYNAMIC_STOP, true);
+const DYN_STOP_TIGHTEN_AFTER_TP1 = bool(
+  process.env.DYN_STOP_TIGHTEN_AFTER_TP1,
+  true
+);
+const DYN_STOP_BUFFER_BPS = clamp(
+  num(process.env.DYN_STOP_BUFFER_BPS, 80),
+  10,
+  1000
+); // peak - buffer 방식
+const CANDLE_MIN_REFRESH_MS = clamp(
+  num(process.env.CANDLE_MIN_REFRESH_MS, 5000),
+  1000,
+  60_000
+);
+const AUTOSAVE_MIN = clamp(num(process.env.AUTOSAVE_MIN, 5), 1, 120);
 
-const BREAKOUT_LOOKBACK = Number(process.env.BREAKOUT_LOOKBACK ?? 6);
-const BREAKOUT_TOL_BPS = Number(process.env.BREAKOUT_TOL_BPS ?? 15);
-
-const USE_REGIME_FILTER =
-  String(process.env.USE_REGIME_FILTER ?? "true") === "true";
-const REGIME_EMA_FAST = Number(process.env.REGIME_EMA_FAST ?? 20);
-const REGIME_EMA_SLOW = Number(process.env.REGIME_EMA_SLOW ?? 60);
-
-const TP1 = Number(process.env.TP1 ?? 0.012);
-const TP2 = Number(process.env.TP2 ?? 0.022);
-const TRAIL = Number(process.env.TRAIL ?? -0.015);
-const USE_BEP_AFTER_TP1 =
-  String(process.env.USE_BEP_AFTER_TP1 ?? "true") === "true";
-
-const MAX_TRADES_PER_DAY = Number(process.env.MAX_TRADES_PER_DAY ?? 4);
-const MAX_CONCURRENT_POS = Number(process.env.MAX_CONCURRENT_POSITIONS ?? 3);
-
-const QUIET_HOUR_START = Number(process.env.QUIET_HOUR_START ?? 2);
-const QUIET_HOUR_END = Number(process.env.QUIET_HOUR_END ?? 6);
-
-// 동기화 옵션
-const SYNC_MIN_KRW = Number(process.env.SYNC_MIN_KRW ?? 3000);
-const SYNC_TOLERANCE_BPS = Number(process.env.SYNC_TOLERANCE_BPS ?? 50);
-const SYNC_POS_INTERVAL_MIN = Number(process.env.SYNC_POS_INTERVAL_MIN ?? 15);
-const REMOVE_STRIKE_REQUIRED = Number(process.env.SYNC_REMOVE_STRIKE ?? 2);
+console.log("CONFIG", {
+  MODE,
+  SYMBOL_CCXT,
+  TF,
+  BASE_CAPITAL_KRW,
+  POS_PCT,
+  LIVE_MIN_ORDER_KRW,
+  ENTRY_SLIPPAGE_BPS,
+  BREAKOUT_LOOKBACK,
+  BREAKOUT_TOL_BPS,
+  REGIME_EMA_FAST,
+  REGIME_EMA_SLOW,
+  TP1,
+  TP2,
+  TRAIL,
+  MAX_TRADES_PER_DAY,
+  MAX_CONCURRENT_POS,
+  STOP_LOSS_PCT,
+});
 
 // ===================== TYPES/STATE =====================
 type Pos = {
@@ -63,6 +129,8 @@ type Pos = {
   peak: number; // persist 타입에 맞춰 필수
   tookTP1: boolean; // persist 타입에 맞춰 필수
   openedAt: number;
+  stopPrice?: number; // 동적/기본 손절가
+  initialRiskPct?: number; // 최초 손절 퍼센트 기록
 };
 const positions: Map<string, Pos> = new Map();
 
@@ -187,6 +255,27 @@ async function fetchCandles(
   } catch {
     return [] as Candle[];
   }
+}
+// ===== Candle Cache =====
+const candleCache: Map<string, { next: number; data: Candle[] }> = new Map();
+function fetchTfMs(tf: string): number {
+  const m = /^(\d+)([mhd])$/i.exec(tf.trim());
+  if (!m) return 5 * 60 * 1000;
+  const v = Number(m[1]);
+  const u = m[2].toLowerCase();
+  if (u === "m") return v * 60 * 1000;
+  if (u === "h") return v * 60 * 60 * 1000;
+  if (u === "d") return v * 24 * 60 * 60 * 1000;
+  return v * 60 * 1000;
+}
+async function fetchCandlesCached(symbol: string, tf: string, limit = 200) {
+  const key = `${symbol}:${tf}`;
+  const now = Date.now();
+  const rec = candleCache.get(key);
+  if (rec && rec.next > now) return rec.data;
+  const data = await fetchCandles(symbol, tf, limit);
+  candleCache.set(key, { data, next: now + CANDLE_MIN_REFRESH_MS });
+  return data;
 }
 function ema(values: number[], period: number): number[] {
   if (!values.length) return [];
@@ -403,8 +492,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         continue;
       }
 
-      // 캔들 갱신
-      const candles = await fetchCandles(symbol, TF, 120);
+      // 캔들 갱신 (캐시)
+      const candles = await fetchCandlesCached(symbol, TF, 120);
       if (!candles.length) {
         await sleep(1000);
         continue;
@@ -448,6 +537,38 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
           const pnlPct = (lastPx - pos.entry) / pos.entry;
 
+          // 동적 / 기본 손절 갱신
+          if (USE_DYNAMIC_STOP) {
+            const buffer = pos.entry * (DYN_STOP_BUFFER_BPS / 10000);
+            const candidate = pos.peak - buffer;
+            if (!pos.stopPrice || candidate > pos.stopPrice) {
+              pos.stopPrice = candidate;
+            }
+            if (pos.tookTP1 && DYN_STOP_TIGHTEN_AFTER_TP1 && pos.stopPrice) {
+              const tighten = pos.entry * 0.002; // 0.2% tighten
+              pos.stopPrice = Math.max(pos.stopPrice, pos.entry + tighten);
+            }
+          } else {
+            // static stop (최초 지정 없으면 entry 기반)
+            if (!pos.stopPrice) pos.stopPrice = pos.entry * (1 + STOP_LOSS_PCT);
+          }
+
+          const activeStop = pos.stopPrice ?? pos.entry * (1 + STOP_LOSS_PCT);
+          if (lastPx <= activeStop) {
+            const r = await marketSell(symbol, pos.size);
+            if (r.ok) {
+              positions.delete(symbol);
+              await tg(
+                `❌ 손절: ${symbol} @${Math.round(lastPx)} (${(
+                  ((lastPx - pos.entry) / pos.entry) *
+                  100
+                ).toFixed(2)}%) stop=${Math.round(activeStop)}`
+              );
+            } else {
+              await tg(`❗ 손절 실패: ${symbol} | ${r.reason}`);
+            }
+          }
+
           // TP1 (절반 익절)
           if (!pos.tookTP1 && pnlPct >= TP1) {
             const sellAmt = pos.size * 0.5;
@@ -457,6 +578,9 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               pos.invested = pos.size * lastPx;
               pos.tookTP1 = true;
               if (USE_BEP_AFTER_TP1) pos.entry = Math.min(pos.entry, lastPx);
+              if (pos.stopPrice && pos.stopPrice < pos.entry) {
+                pos.stopPrice = pos.entry * 0.999; // 수수료 고려 살짝 아래
+              }
               positions.set(symbol, pos);
               await tg(
                 `✅ TP1: ${symbol} 50% 익절 | 잔여=${pos.size.toFixed(6)}`
@@ -508,6 +632,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                   if (!Number.isFinite(size) || size <= 0) {
                     await tg(`❗ 진입 실패: ${symbol} | invalid-size`);
                   } else {
+                    const baseStop = lastPx * (1 + STOP_LOSS_PCT);
                     positions.set(symbol, {
                       entry: lastPx,
                       size,
@@ -515,6 +640,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                       peak: lastPx,
                       tookTP1: false,
                       openedAt: Date.now(),
+                      stopPrice: baseStop,
+                      initialRiskPct: STOP_LOSS_PCT,
                     });
                     incTradeCount(symbol);
                     await tg(
@@ -555,9 +682,24 @@ async function main() {
   try {
     const prev = await loadState();
     if (prev?.positions) {
-      for (const [k, v] of Object.entries(
-        prev.positions as Record<string, Pos>
-      )) {
+      for (const [k, raw] of Object.entries(prev.positions as any)) {
+        const vRaw: any = raw as any;
+        const v: Pos = {
+          entry: Number(vRaw.entry) || 0,
+          size: Number(vRaw.size) || 0,
+          invested: Number(vRaw.invested) || 0,
+          peak: Number(vRaw.peak ?? vRaw.entry) || 0,
+          tookTP1: Boolean(vRaw.tookTP1),
+          openedAt: Number(vRaw.openedAt) || Date.now(),
+          stopPrice:
+            typeof vRaw.stopPrice === "number"
+              ? Number(vRaw.stopPrice)
+              : undefined,
+          initialRiskPct:
+            typeof vRaw.initialRiskPct === "number"
+              ? Number(vRaw.initialRiskPct)
+              : undefined,
+        };
         positions.set(k, v);
       }
     }
@@ -607,6 +749,21 @@ async function main() {
     }, syncMs);
   }, syncMs);
 
+  // Autosave
+  const autosaveMs = AUTOSAVE_MIN * 60 * 1000;
+  setInterval(() => {
+    try {
+      const out: Record<string, Pos> = {};
+      positions.forEach((v, k) => (out[k] = { ...v }));
+      const trades: Record<string, number> = {};
+      tradeCounter.forEach((cnt, k) => (trades[k] = cnt));
+      saveState({ positions: out as any, tradesToday: trades, paused });
+      console.log("[AUTOSAVE] persisted");
+    } catch (e) {
+      console.error("[AUTOSAVE] fail", e);
+    }
+  }, autosaveMs);
+
   process.on("SIGINT", async () => {
     await tg("👋 종료(SIGINT)");
     try {
@@ -631,7 +788,11 @@ async function main() {
           peak: Number(v.peak ?? v.entry) || 0,
           tookTP1: Boolean(v.tookTP1),
           openedAt: Number(v.openedAt) || Date.now(),
-        };
+          // 추가 메타 (백업용)
+          stopPrice: typeof v.stopPrice === "number" ? v.stopPrice : undefined,
+          initialRiskPct:
+            typeof v.initialRiskPct === "number" ? v.initialRiskPct : undefined,
+        } as any;
       });
 
       const tradesTodayObj: Record<string, number> = {};
@@ -668,7 +829,10 @@ async function main() {
           peak: Number(v.peak ?? v.entry) || 0,
           tookTP1: Boolean(v.tookTP1),
           openedAt: Number(v.openedAt) || Date.now(),
-        };
+          stopPrice: typeof v.stopPrice === "number" ? v.stopPrice : undefined,
+          initialRiskPct:
+            typeof v.initialRiskPct === "number" ? v.initialRiskPct : undefined,
+        } as any;
       });
 
       const tradesTodayObj: Record<string, number> = {};
