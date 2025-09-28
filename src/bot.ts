@@ -102,6 +102,8 @@ const FORCE_EXIT_DD_BPS = Number(process.env.FORCE_EXIT_DD_BPS ?? "0"); // 예:-
 
 const LOOP_DELAY_MS = 1500;
 
+const DUST_KRW_MIN = 3000;
+
 // =============== HELPERS ===============
 function num(v: any, d: number) {
   const n = Number(v);
@@ -653,6 +655,51 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * 시작 시 1회: 지갑 잔고를 현재 가격으로 환산하여 포지션 맵(positions)에 채워 넣는다.
+ * - DUST_KRW_MIN 미만 금액은 무시(먼지)
+ * - 이미 포지션이 있는 심볼은 건너뜀(중복 방지)
+ * - 동기화된 심볼마다 텔레그램에 보고
+ */
+async function syncPositionsFromWallet(
+  symbols: string[],
+  feed: UpbitTickerFeed
+) {
+  try {
+    const bal = await exchange.fetchBalance();
+    for (const s of symbols) {
+      if (positions.has(s)) continue; // 이미 포지션이 있으면 스킵
+      const base = s.split("/")[0];
+      const code = toUpbitCode(s);
+      const lastPx = feed.get(code);
+      if (!lastPx || lastPx <= 0) continue; // 아직 WS 틱을 못 받았으면 스킵
+
+      const qty = getBalanceTotal(bal, base); // 지갑에 있는 베이스 수량
+      if (!Number.isFinite(qty) || qty <= 0) continue;
+
+      const krw = qty * lastPx;
+      if (krw < DUST_KRW_MIN) continue; // 먼지 잔고는 무시
+
+      const p: Pos = {
+        entry: lastPx,
+        size: qty,
+        invested: krw,
+        peak: lastPx,
+        tookTP1: false,
+        openedAt: Date.now(),
+      };
+      positions.set(s, p);
+      await tg(
+        `🔄 잔고 동기화: ${s} | 수량≈${qty.toFixed(6)} | KRW≈${Math.round(
+          krw
+        )} (entry≈${Math.round(lastPx)})`
+      );
+    }
+  } catch (e: any) {
+    await tg(`⚠️ 잔고 동기화 실패: ${e?.message || e}`);
+  }
+}
+
 // =============== MAIN ===============
 async function main() {
   const symbols = TRADE_COINS.length ? TRADE_COINS : [SYMBOL_CCXT];
@@ -667,20 +714,13 @@ async function main() {
     `🚀 BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`
   );
 
-  // 잔고-상태 불일치 경고 (읽기 전용)
-  try {
-    const bal = await exchange.fetchBalance();
-    for (const s of symbols) {
-      const base = s.split("/")[0];
-      const qty = getBalanceTotal(bal, base);
-      if (qty > 0 && !positions.has(s)) {
-        await tg(
-          `⚠️ 잔고-상태 불일치: ${s} 보유≈${qty} (봇 포지션 없음). 수동 확인 권장.`
-        );
-      }
-    }
-  } catch {}
+  // (선택) 시작 시 잔고-상태 불일치 경고 로직은 남겨두어도 무방하지만,
+  // 아래 동기화가 선행되면 경고가 크게 줄어듭니다.
 
+  // ✅ 추가: 지갑 잔고 → 포지션 맵 동기화 (먼지 제외)
+  await syncPositionsFromWallet(symbols, feed);
+
+  // 이후 실행 루프 시작
   symbols.forEach((s) => {
     runner(s, feed);
   });
