@@ -8,6 +8,11 @@ declare module "ccxt" {
   export interface Market {
     symbol: string;
     precision?: { amount?: number; price?: number };
+    limits?: {
+      amount?: { min?: number; max?: number };
+      cost?: { min?: number; max?: number };
+      price?: { min?: number; max?: number };
+    };
   }
 
   export interface Balance {

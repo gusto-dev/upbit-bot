@@ -131,12 +131,30 @@ type Pos = {
   openedAt: number;
   stopPrice?: number; // 동적/기본 손절가
   initialRiskPct?: number; // 최초 손절 퍼센트 기록
+  originalEntry?: number; // 최초 진입가 (BEP 조정 전)
 };
 const positions: Map<string, Pos> = new Map();
 
 // tradesToday: persist 규격에 맞게 "숫자만" 저장
 const tradeCounter: Map<string, number> = new Map();
 let paused = false; // persist용
+let realizedToday = 0; // 누적 실현 손익 (KRW)
+const failureCounts: Record<string, number> = {};
+function incFail(reason: string) {
+  failureCounts[reason] = (failureCounts[reason] || 0) + 1;
+}
+const MAX_DAILY_DRAWDOWN_PCT = clamp(
+  num(process.env.MAX_DAILY_DRAWDOWN_PCT, -0.05),
+  -0.5,
+  -0.001
+); // 음수: -0.05 => -5%
+function canEnterByLossLimit(): boolean {
+  if (MAX_DAILY_DRAWDOWN_PCT >= 0) return true; // 비활성화 의미
+  const baseEq = BASE_CAPITAL_KRW;
+  if (baseEq <= 0) return true;
+  const ddPct = realizedToday / baseEq; // realizedToday가 손실이면 음수
+  return ddPct > MAX_DAILY_DRAWDOWN_PCT; // 더 낮게 내려가면 false
+}
 
 // ===================== EXCHANGE =====================
 const exchange = new ccxt.upbit({
@@ -411,17 +429,15 @@ async function reconcilePositionsFromWallet(
 
 // ===================== ORDER HELPERS =====================
 function todayStrKST() {
-  return new Date(
-    new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" })
-  )
-    .toISOString()
-    .slice(0, 10);
+  // Stable KST date string (YYYY-MM-DD) without timezone re-interpretation issues
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Seoul" });
 }
 let counterDay = todayStrKST();
 function ensureDayFresh() {
   const t = todayStrKST();
   if (t !== counterDay) {
     tradeCounter.clear(); // 날짜 바뀌면 일일 카운터 리셋
+    realizedToday = 0; // 일 변경 시 실현 손익 리셋
     counterDay = t;
   }
 }
@@ -436,28 +452,95 @@ function getTradeCount(sym: string) {
   return tradeCounter.get(sym) || 0;
 }
 
+let _marketsLoaded = false;
 async function marketBuy(symbol: string, lastPx: number) {
-  const budgetKRW = Math.max(
+  if (!_marketsLoaded) {
+    try {
+      await exchange.loadMarkets();
+    } catch {}
+    _marketsLoaded = true;
+  }
+  const mi: any = getMarketInfo(symbol);
+
+  // 목표 예산(KRW) 산출
+  const targetCost = Math.max(
     LIVE_MIN_ORDER_KRW,
     Math.floor(BASE_CAPITAL_KRW * POS_PCT)
   );
-  const amount = budgetKRW / lastPx;
 
-  await exchange.loadMarkets();
-  const mi = getMarketInfo(symbol);
-  const step = mi?.precision?.amount ? Math.pow(10, -mi.precision.amount) : 0; // upbit precision 대응
-  const amt = step ? floorToStep(amount, step) : amount;
+  // 마켓 최소 비용/수량 확인 (Upbit는 최소 주문 금액 제한 존재)
+  const minCost = Number(mi?.limits?.cost?.min) || LIVE_MIN_ORDER_KRW;
+  if (targetCost < minCost) {
+    return {
+      ok: false as const,
+      reason: `cost-below-min (target=${targetCost} < min=${minCost})`,
+    };
+  }
 
-  if (budgetKRW < LIVE_MIN_ORDER_KRW || amt <= 0)
+  // 수량 계산 후 라운딩
+  const rawAmount = targetCost / lastPx;
+  const step = mi?.precision?.amount ? Math.pow(10, -mi.precision.amount) : 0;
+  let amount = step ? floorToStep(rawAmount, step) : rawAmount;
+
+  // 최소 수량 제한 확인
+  const minAmount = Number(mi?.limits?.amount?.min) || 0;
+  if (minAmount && amount < minAmount) {
+    // minAmount 맞추기 위해 비용 재계산(상향) 시도
+    amount = minAmount;
+  }
+
+  if (amount <= 0) {
     return { ok: false as const, reason: "amount-too-small" };
+  }
 
-  if (MODE === "paper")
-    return { ok: true as const, paper: true as const, amt: Number(amt) };
+  // 최종 비용 재확인
+  const finalCost = amount * lastPx;
+  if (finalCost < minCost) {
+    return {
+      ok: false as const,
+      reason: `final-cost-below-min (final=${finalCost.toFixed(
+        2
+      )} < min=${minCost})`,
+    };
+  }
+
+  if (MODE === "paper") {
+    return { ok: true as const, paper: true as const, amt: Number(amount) };
+  }
 
   try {
-    const o = await exchange.createOrder(symbol, "market", "buy", amt);
-    return { ok: true as const, order: o, amt: Number(amt) };
+    // Upbit: market buy 시 price 필요 -> amount는 base 수량, price 전달
+    // ccxt 옵션: createMarketBuyOrderRequiresPrice (기본 true)
+    const o = await exchange.createOrder(
+      symbol,
+      "market",
+      "buy",
+      amount,
+      lastPx // price hint
+    );
+    return { ok: true as const, order: o, amt: Number(amount) };
   } catch (e: any) {
+    // 대체 경로: 가격 없이 cost 제공 (ccxt 설정 변경 필요할 수 있음)
+    if (/requires the price/i.test(e?.message || "")) {
+      try {
+        // cost 방식: amount 자리에 quote cost 넣는 패턴 (옵션 비활성화 가정)
+        const cost = finalCost;
+        const o2 = await exchange.createOrder(
+          symbol,
+          "market",
+          "buy",
+          cost,
+          undefined,
+          { createMarketBuyOrderRequiresPrice: false }
+        );
+        return { ok: true as const, order: o2, amt: Number(amount) };
+      } catch (e2: any) {
+        return {
+          ok: false as const,
+          reason: e2?.message || "buy-failed-alt",
+        };
+      }
+    }
     return { ok: false as const, reason: e?.message || "buy-failed" };
   }
 }
@@ -542,7 +625,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             const buffer = pos.entry * (DYN_STOP_BUFFER_BPS / 10000);
             const candidate = pos.peak - buffer;
             if (!pos.stopPrice || candidate > pos.stopPrice) {
-              pos.stopPrice = candidate;
+              // stop은 entry보다 아래로 (롱 기준) 너무 올라가지 않도록 (진입 직후 peak=entry 상황 보호)
+              pos.stopPrice = Math.min(candidate, pos.peak * 0.9995);
             }
             if (pos.tookTP1 && DYN_STOP_TIGHTEN_AFTER_TP1 && pos.stopPrice) {
               const tighten = pos.entry * 0.002; // 0.2% tighten
@@ -554,19 +638,27 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           }
 
           const activeStop = pos.stopPrice ?? pos.entry * (1 + STOP_LOSS_PCT);
+          let fullyExited = false;
           if (lastPx <= activeStop) {
             const r = await marketSell(symbol, pos.size);
             if (r.ok) {
+              const refEntry = pos.originalEntry ?? pos.entry;
+              realizedToday += (lastPx - refEntry) * pos.size;
               positions.delete(symbol);
               await tg(
                 `❌ 손절: ${symbol} @${Math.round(lastPx)} (${(
-                  ((lastPx - pos.entry) / pos.entry) *
+                  ((lastPx - refEntry) / refEntry) *
                   100
                 ).toFixed(2)}%) stop=${Math.round(activeStop)}`
               );
+              fullyExited = true;
             } else {
               await tg(`❗ 손절 실패: ${symbol} | ${r.reason}`);
             }
+          }
+          if (fullyExited) {
+            await sleep(1000);
+            continue; // 손절 후 다른 청산 로직 중복 방지
           }
 
           // TP1 (절반 익절)
@@ -582,6 +674,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 pos.stopPrice = pos.entry * 0.999; // 수수료 고려 살짝 아래
               }
               positions.set(symbol, pos);
+              const refEntry = pos.originalEntry ?? pos.entry;
+              realizedToday += sellAmt * (lastPx - refEntry);
               await tg(
                 `✅ TP1: ${symbol} 50% 익절 | 잔여=${pos.size.toFixed(6)}`
               );
@@ -594,6 +688,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           if (pnlPct >= TP2) {
             const r = await marketSell(symbol, pos.size);
             if (r.ok) {
+              const refEntry = pos.originalEntry ?? pos.entry;
+              realizedToday += (lastPx - refEntry) * pos.size;
               positions.delete(symbol);
               await tg(`🎯 TP2: ${symbol} 전량 익절`);
             } else {
@@ -602,6 +698,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           } else if ((lastPx - pos.peak) / pos.peak <= TRAIL) {
             const r = await marketSell(symbol, pos.size);
             if (r.ok) {
+              const refEntry = pos.originalEntry ?? pos.entry;
+              realizedToday += (lastPx - refEntry) * pos.size;
               positions.delete(symbol);
               await tg(`🛑 트레일 스탑: ${symbol} 청산`);
             } else {
@@ -611,7 +709,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         }
 
         // ====== 신규 진입 ======
-        if (!inPos && !quiet) {
+        if (!inPos && !quiet && canEnterByLossLimit()) {
           if (Array.from(positions.keys()).length >= MAX_CONCURRENT_POS) {
             // 동시 포지션 제한 → 스킵
           } else if (getTradeCount(symbol) >= MAX_TRADES_PER_DAY) {
@@ -635,6 +733,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                     const baseStop = lastPx * (1 + STOP_LOSS_PCT);
                     positions.set(symbol, {
                       entry: lastPx,
+                      originalEntry: lastPx,
                       size,
                       invested: size * lastPx,
                       peak: lastPx,
@@ -652,6 +751,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                   }
                 } else {
                   await tg(`❗ 진입 실패: ${symbol} | ${r.reason}`);
+                  incFail(r.reason);
                 }
               } else {
                 await tg(
@@ -659,6 +759,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                     1
                   )}bps`
                 );
+                incFail("slippage-exceeded");
               }
             }
           }
@@ -699,6 +800,10 @@ async function main() {
             typeof vRaw.initialRiskPct === "number"
               ? Number(vRaw.initialRiskPct)
               : undefined,
+          originalEntry:
+            typeof vRaw.originalEntry === "number"
+              ? Number(vRaw.originalEntry)
+              : Number(vRaw.entry) || 0,
         };
         positions.set(k, v);
       }
@@ -713,6 +818,14 @@ async function main() {
     }
     if (typeof (prev as any).paused !== "undefined") {
       paused = Boolean((prev as any).paused);
+    }
+    if (prev?.failureCounts) {
+      for (const [k, v] of Object.entries(prev.failureCounts)) {
+        failureCounts[k] = Number(v) || 0;
+      }
+    }
+    if (typeof (prev as any).realizedToday === "number") {
+      realizedToday = Number((prev as any).realizedToday) || 0;
     }
   } catch {}
 
@@ -757,8 +870,14 @@ async function main() {
       positions.forEach((v, k) => (out[k] = { ...v }));
       const trades: Record<string, number> = {};
       tradeCounter.forEach((cnt, k) => (trades[k] = cnt));
-      saveState({ positions: out as any, tradesToday: trades, paused });
-      console.log("[AUTOSAVE] persisted");
+      saveState({
+        positions: out as any,
+        tradesToday: trades,
+        paused,
+        realizedToday,
+        failureCounts,
+      });
+      console.log("[AUTOSAVE] persisted", { realizedToday });
     } catch (e) {
       console.error("[AUTOSAVE] fail", e);
     }
@@ -802,6 +921,8 @@ async function main() {
         positions: outStrict,
         tradesToday: tradesTodayObj,
         paused,
+        realizedToday,
+        failureCounts,
       });
     } catch {}
     process.exit(0);
@@ -842,6 +963,8 @@ async function main() {
         positions: outStrict,
         tradesToday: tradesTodayObj,
         paused,
+        realizedToday,
+        failureCounts,
       });
     } catch {}
     process.exit(0);

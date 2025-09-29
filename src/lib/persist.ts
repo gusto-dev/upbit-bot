@@ -15,20 +15,41 @@ export type SavedState = {
       tookTP1: boolean;
       openedAt: number;
       bePrice?: number;
+      stopPrice?: number;
+      initialRiskPct?: number;
+      originalEntry?: number;
     }
   >;
   tradesToday: Record<string, number>;
   paused: boolean;
+  realizedToday?: number; // 누적 실현손익 (KRW)
+  failureCounts?: Record<string, number>;
 };
 
 export function loadState(): SavedState {
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     if (!fs.existsSync(STATE_FILE))
-      return { positions: {}, tradesToday: {}, paused: false };
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+      return {
+        positions: {},
+        tradesToday: {},
+        paused: false,
+        realizedToday: 0,
+        failureCounts: {},
+      };
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    if (typeof raw.realizedToday !== "number") raw.realizedToday = 0;
+    if (typeof raw.failureCounts !== "object" || !raw.failureCounts)
+      raw.failureCounts = {};
+    return raw;
   } catch {
-    return { positions: {}, tradesToday: {}, paused: false };
+    return {
+      positions: {},
+      tradesToday: {},
+      paused: false,
+      realizedToday: 0,
+      failureCounts: {},
+    };
   }
 }
 
