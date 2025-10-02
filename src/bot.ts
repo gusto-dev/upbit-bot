@@ -80,8 +80,14 @@ let REMOVE_STRIKE_REQUIRED = clamp(
   1,
   10
 );
+// STOP_LOSS_PCT 우선, 없으면 과거 변수명 STOP_LOSS fallback
 const STOP_LOSS_PCT = clamp(
-  num(process.env.STOP_LOSS_PCT, -0.03),
+  num(
+    process.env.STOP_LOSS_PCT !== undefined
+      ? process.env.STOP_LOSS_PCT
+      : process.env.STOP_LOSS,
+    -0.03
+  ),
   -0.3,
   -0.001
 );
@@ -102,12 +108,47 @@ const CANDLE_MIN_REFRESH_MS = clamp(
 );
 const AUTOSAVE_MIN = clamp(num(process.env.AUTOSAVE_MIN, 5), 1, 120);
 
+// ===== 추가 사이징/리스크 옵션 =====
+// 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
+const FIXED_ENTRY_KRW = clamp(
+  num(process.env.FIXED_ENTRY_KRW, 0),
+  0,
+  1_000_000_000
+);
+// 심볼별 커스텀 진입 금액: PER_SYMBOL_ENTRY="BTC/KRW:70000,ETH/KRW:80000"
+const PER_SYMBOL_ENTRY_RAW = process.env.PER_SYMBOL_ENTRY || "";
+const PER_SYMBOL_ENTRY: Record<string, number> = {};
+if (PER_SYMBOL_ENTRY_RAW.trim()) {
+  PER_SYMBOL_ENTRY_RAW.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .forEach((pair) => {
+      const [sym, val] = pair.split(":");
+      const v = Math.floor(Number(val));
+      if (sym && Number.isFinite(v) && v > 0) PER_SYMBOL_ENTRY[sym.trim()] = v;
+    });
+}
+// 총 익스포저 제한 (현재 오픈 포지션 invested 총합 + 신규 예정 금액) / BASE_CAPITAL_KRW <= 제한
+const TOT_EXPOSURE_GUARD_PCT = clamp(
+  num(process.env.TOT_EXPOSURE_GUARD_PCT, 0.9),
+  0.05,
+  5
+); // 5배 이상은 비현실적이므로 상한
+
+function plannedEntryCost(symbol: string): number {
+  // 우선순위: 심볼별 > 고정 > 비율(POS_PCT)
+  if (PER_SYMBOL_ENTRY[symbol]) return PER_SYMBOL_ENTRY[symbol];
+  if (FIXED_ENTRY_KRW > 0) return FIXED_ENTRY_KRW;
+  return Math.floor(BASE_CAPITAL_KRW * POS_PCT);
+}
+
 console.log("CONFIG", {
   MODE,
   SYMBOL_CCXT,
   TF,
   BASE_CAPITAL_KRW,
   POS_PCT,
+  FIXED_ENTRY_KRW,
   LIVE_MIN_ORDER_KRW,
   ENTRY_SLIPPAGE_BPS,
   BREAKOUT_LOOKBACK,
@@ -121,6 +162,7 @@ console.log("CONFIG", {
   MAX_CONCURRENT_POS,
   STOP_LOSS_PCT,
   FEE_BPS,
+  TOT_EXPOSURE_GUARD_PCT,
 });
 
 // ===================== TYPES/STATE =====================
@@ -504,10 +546,9 @@ async function preflight(symbols: string[]) {
   for (const sym of symbols) {
     const mi: any = getMarketInfo(sym) || {};
     const minCost = Number(mi?.limits?.cost?.min) || LIVE_MIN_ORDER_KRW;
-    const baseTarget = Math.max(
-      LIVE_MIN_ORDER_KRW,
-      Math.floor(BASE_CAPITAL_KRW * POS_PCT)
-    );
+    let baseTarget = plannedEntryCost(sym);
+    if (baseTarget < LIVE_MIN_ORDER_KRW) baseTarget = LIVE_MIN_ORDER_KRW;
+    // 마켓 최소 금액보다 작으면 자동 업스케일(기존 로직 유지)
     const precisionDigits = Number.isInteger(mi?.precision?.amount)
       ? mi.precision.amount
       : undefined;
@@ -531,10 +572,8 @@ async function marketBuy(symbol: string, lastPx: number) {
   const mi: any = getMarketInfo(symbol);
 
   // 목표 예산(KRW) 산출
-  let targetCost = Math.max(
-    LIVE_MIN_ORDER_KRW,
-    Math.floor(BASE_CAPITAL_KRW * POS_PCT)
-  );
+  let targetCost = plannedEntryCost(symbol);
+  if (targetCost < LIVE_MIN_ORDER_KRW) targetCost = LIVE_MIN_ORDER_KRW;
 
   // 마켓 최소 비용/수량 확인 (Upbit는 최소 주문 금액 제한 존재)
   const minCost = Number(mi?.limits?.cost?.min) || LIVE_MIN_ORDER_KRW;
@@ -1026,6 +1065,28 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           } else if (getTradeCount(symbol) >= MAX_TRADES_PER_DAY) {
             // 일일 진입 제한 → 스킵
           } else {
+            // 총 익스포저 가드 확인
+            try {
+              const curExposure = Array.from(positions.values()).reduce(
+                (acc, p) => acc + (Number(p.invested) || 0),
+                0
+              );
+              const plannedCost = plannedEntryCost(symbol);
+              const limitCap = BASE_CAPITAL_KRW * TOT_EXPOSURE_GUARD_PCT;
+              if (limitCap > 0 && curExposure + plannedCost > limitCap) {
+                incFail("exposure-cap");
+                // 노출 한도 초과 → 스킵 (텔레그램 한번 알림)
+                await tg(
+                  `⛔ 익스포저 제한: cur=${curExposure.toFixed(
+                    0
+                  )} + plan=${plannedCost.toFixed(0)} > cap=${limitCap.toFixed(
+                    0
+                  )}`
+                );
+                await sleep(1500);
+                continue;
+              }
+            } catch {}
             const regimeOk = !USE_REGIME_FILTER || fast >= slow;
             const tol = hh * (BREAKOUT_TOL_BPS / 10000);
             const breakoutOk = lastPx >= hh + tol;
