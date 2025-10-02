@@ -54,6 +54,7 @@ let TP1 = clamp(num(process.env.TP1, 0.012), 0.001, 0.2);
 let TP2 = clamp(num(process.env.TP2, 0.022), TP1 + 0.001, 0.5);
 let TRAIL = clamp(num(process.env.TRAIL, -0.015), -0.2, -0.001);
 const USE_BEP_AFTER_TP1 = bool(process.env.USE_BEP_AFTER_TP1, true);
+let FEE_BPS = clamp(num(process.env.FEE_BPS, 5), 0, 100); // 0.05% 기본 (5 bps)
 let MAX_TRADES_PER_DAY = clamp(num(process.env.MAX_TRADES_PER_DAY, 4), 1, 50);
 let MAX_CONCURRENT_POS = clamp(
   num(process.env.MAX_CONCURRENT_POSITIONS, 3),
@@ -119,6 +120,7 @@ console.log("CONFIG", {
   MAX_TRADES_PER_DAY,
   MAX_CONCURRENT_POS,
   STOP_LOSS_PCT,
+  FEE_BPS,
 });
 
 // ===================== TYPES/STATE =====================
@@ -132,6 +134,10 @@ type Pos = {
   stopPrice?: number; // 동적/기본 손절가
   initialRiskPct?: number; // 최초 손절 퍼센트 기록
   originalEntry?: number; // 최초 진입가 (BEP 조정 전)
+  accFee?: number; // 누적 수수료 (quote 단위)
+  runningNet?: number; // 부분 실현 순익 누계
+  runningGross?: number; // 부분 실현 총익
+  runningFee?: number; // 부분 실현 수수료 합
 };
 const positions: Map<string, Pos> = new Map();
 
@@ -143,6 +149,11 @@ const failureCounts: Record<string, number> = {};
 function incFail(reason: string) {
   failureCounts[reason] = (failureCounts[reason] || 0) + 1;
 }
+let winsToday = 0;
+let lossesToday = 0;
+let grossToday = 0;
+let feeToday = 0;
+// realizedToday 는 netToday 로 사용 (기존 변수 재활용)
 const MAX_DAILY_DRAWDOWN_PCT = clamp(
   num(process.env.MAX_DAILY_DRAWDOWN_PCT, -0.05),
   -0.5,
@@ -162,6 +173,24 @@ const exchange = new ccxt.upbit({
   secret: UPBIT_SECRET || undefined,
   enableRateLimit: true,
 });
+
+// ===================== FEES =====================
+// Upbit 기본 수수료 (예: 0.05% = 5 bps) 각 체결금액 기준 양쪽 모두 발생한다고 가정 (시장가/지정가 동일 비율 가정)
+// 순손익(net) 계산: gross = (exit - entry) * qty, fee = (entry + exit) * qty * feeRate
+// net = gross - fee
+const FEE_RATE = FEE_BPS / 10000;
+function netPnlAfterFees(entry: number, exit: number, qty: number) {
+  const gross = (exit - entry) * qty;
+  if (FEE_RATE <= 0) return gross;
+  const fee = (entry + exit) * qty * FEE_RATE;
+  return gross - fee;
+}
+function pnlBreakdown(entry: number, exit: number, qty: number) {
+  const gross = (exit - entry) * qty;
+  const fee = FEE_RATE > 0 ? (entry + exit) * qty * FEE_RATE : 0;
+  const net = gross - fee;
+  return { gross, fee, net };
+}
 
 // ===================== TELEGRAM =====================
 async function tg(text: string) {
@@ -437,7 +466,7 @@ function ensureDayFresh() {
   const t = todayStrKST();
   if (t !== counterDay) {
     tradeCounter.clear(); // 날짜 바뀌면 일일 카운터 리셋
-    realizedToday = 0; // 일 변경 시 실현 손익 리셋
+    // realizedToday 초기화는 데일리 리포트 타이머에서 처리
     counterDay = t;
   }
 }
@@ -627,6 +656,49 @@ async function marketSell(symbol: string, amt: number) {
   }
 }
 
+// ===== 실제 체결 기반 보정 (엔트리) =====
+async function refineEntryFromTrades(
+  symbol: string,
+  expectedAmt: number,
+  pos: Pos
+) {
+  try {
+    const since = Date.now() - 60_000; // 최근 1분 내 체결 탐색
+    // ccxt upbit fetchMyTrades(symbol?, since?, limit?)
+    const trades: any[] = await (exchange as any)
+      .fetchMyTrades(symbol, since, 50)
+      .catch(() => []);
+    if (!Array.isArray(trades) || !trades.length) return;
+    // side==='buy' & amount 합이 예상 수량에 근접한 것들 (최근 것부터 역순 누적)
+    const buys = trades.filter((t) => t.side === "buy" && t.symbol === symbol);
+    if (!buys.length) return;
+    // 시간 역순 정렬
+    buys.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    let accAmt = 0;
+    let costSum = 0;
+    let feeSum = 0;
+    for (const tr of buys) {
+      const a = Number(tr.amount) || 0;
+      const p = Number(tr.price) || 0;
+      if (a <= 0 || p <= 0) continue;
+      accAmt += a;
+      costSum += a * p;
+      if (tr.fee && typeof tr.fee.cost === "number") {
+        // Upbit 수수료는 quote (KRW) 차감 가정
+        feeSum += tr.fee.cost;
+      }
+      // 충분히 누적되면 종료
+      if (accAmt >= expectedAmt * 0.95) break; // 95% 이상 수집되면 인정
+    }
+    if (accAmt > 0) {
+      const avg = costSum / accAmt;
+      pos.entry = avg; // 실제 평균 매수가
+      if (!pos.originalEntry) pos.originalEntry = avg;
+      pos.accFee = (pos.accFee || 0) + feeSum;
+    }
+  } catch {}
+}
+
 async function tryAdaptiveSell(
   symbol: string,
   desiredAmt: number,
@@ -771,22 +843,31 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               const r = adaptive.result;
               if (r.ok && adaptive.sold > 0) {
                 const refEntry = pos.originalEntry ?? pos.entry;
-                const realizedPart = (lastPx - refEntry) * adaptive.sold;
-                realizedToday += realizedPart;
+                const { gross, fee, net } = pnlBreakdown(
+                  refEntry,
+                  lastPx,
+                  adaptive.sold
+                );
+                realizedToday += net;
+                grossToday += gross;
+                feeToday += fee;
                 const remaining = pos.size - adaptive.sold;
+                const pct = ((lastPx - refEntry) / refEntry) * 100;
                 if (remaining <= pos.size * 0.05 || remaining <= 0) {
                   positions.delete(symbol);
                   fullyExited = true;
                   await tg(
-                    `❌ 손절: ${symbol} @${Math.round(lastPx)} (${(
-                      ((lastPx - refEntry) / refEntry) *
-                      100
-                    ).toFixed(2)}%) sold=${adaptive.sold.toFixed(6)} full-exit`
+                    `❌ 손절: ${symbol} @${Math.round(lastPx)} (${pct.toFixed(
+                      2
+                    )}%) sold=${adaptive.sold.toFixed(
+                      6
+                    )} full-exit\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
+                      0
+                    )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
                   );
                 } else {
                   pos.size = remaining;
                   pos.invested = pos.size * lastPx;
-                  // 부분 손절 후 stop 재배치(보수적): entry 아래로 유지
                   if (pos.stopPrice && pos.stopPrice > activeStop) {
                     pos.stopPrice = activeStop;
                   }
@@ -796,7 +877,9 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                       lastPx
                     )} 남은=${pos.size.toFixed(6)} sold=${adaptive.sold.toFixed(
                       6
-                    )}`
+                    )}\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
+                      0
+                    )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
                   );
                 }
               } else {
@@ -826,9 +909,22 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               }
               positions.set(symbol, pos);
               const refEntry = pos.originalEntry ?? pos.entry;
-              realizedToday += sellAmt * (lastPx - refEntry);
+              const { gross, fee, net } = pnlBreakdown(
+                refEntry,
+                lastPx,
+                sellAmt
+              );
+              realizedToday += net;
+              grossToday += gross;
+              feeToday += fee;
+              if (net >= 0) winsToday++;
+              else lossesToday++;
               await tg(
-                `✅ TP1: ${symbol} 50% 익절 | 잔여=${pos.size.toFixed(6)}`
+                `✅ TP1: ${symbol} 50% 익절 | 잔여=${pos.size.toFixed(
+                  6
+                )}\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
+                  0
+                )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
               );
             } else {
               await tg(`❗ TP1 실패: ${symbol} | ${r.reason}`);
@@ -841,14 +937,25 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             const r = adaptive.result;
             if (r.ok && adaptive.sold > 0) {
               const refEntry = pos.originalEntry ?? pos.entry;
-              realizedToday += (lastPx - refEntry) * adaptive.sold;
+              const { gross, fee, net } = pnlBreakdown(
+                refEntry,
+                lastPx,
+                adaptive.sold
+              );
+              realizedToday += net;
+              grossToday += gross;
+              feeToday += fee;
               const remaining = pos.size - adaptive.sold;
               if (remaining <= pos.size * 0.05 || remaining <= 0) {
                 positions.delete(symbol);
+                if (net >= 0) winsToday++;
+                else lossesToday++;
                 await tg(
                   `🎯 TP2: ${symbol} 전량/거의 전량 익절 sold=${adaptive.sold.toFixed(
                     6
-                  )}`
+                  )}\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
+                    0
+                  )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
                 );
               } else {
                 pos.size = remaining;
@@ -857,7 +964,11 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 await tg(
                   `🎯 TP2 부분: ${symbol} 남은=${remaining.toFixed(
                     6
-                  )} sold=${adaptive.sold.toFixed(6)}`
+                  )} sold=${adaptive.sold.toFixed(6)}\n gross=${gross.toFixed(
+                    0
+                  )} fee=${fee.toFixed(0)} net=${net.toFixed(
+                    0
+                  )} cum=${Math.round(realizedToday)}`
                 );
               }
             } else {
@@ -868,14 +979,25 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             const r = adaptive.result;
             if (r.ok && adaptive.sold > 0) {
               const refEntry = pos.originalEntry ?? pos.entry;
-              realizedToday += (lastPx - refEntry) * adaptive.sold;
+              const { gross, fee, net } = pnlBreakdown(
+                refEntry,
+                lastPx,
+                adaptive.sold
+              );
+              realizedToday += net;
+              grossToday += gross;
+              feeToday += fee;
               const remaining = pos.size - adaptive.sold;
               if (remaining <= pos.size * 0.05 || remaining <= 0) {
                 positions.delete(symbol);
+                if (net >= 0) winsToday++;
+                else lossesToday++;
                 await tg(
                   `🛑 트레일 스탑: ${symbol} 청산 sold=${adaptive.sold.toFixed(
                     6
-                  )}`
+                  )}\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
+                    0
+                  )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
                 );
               } else {
                 pos.size = remaining;
@@ -884,7 +1006,11 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 await tg(
                   `🛑 트레일 부분: ${symbol} 남은=${remaining.toFixed(
                     6
-                  )} sold=${adaptive.sold.toFixed(6)}`
+                  )} sold=${adaptive.sold.toFixed(6)}\n gross=${gross.toFixed(
+                    0
+                  )} fee=${fee.toFixed(0)} net=${net.toFixed(
+                    0
+                  )} cum=${Math.round(realizedToday)}`
                 );
               }
             } else {
@@ -927,6 +1053,13 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                       stopPrice: baseStop,
                       initialRiskPct: STOP_LOSS_PCT,
                     });
+                    const posRef = positions.get(symbol)!;
+                    // 약간의 지연 후 실제 체결 기반 평균가격/수수료 재보정
+                    setTimeout(() => {
+                      refineEntryFromTrades(symbol, size, posRef).catch(
+                        () => {}
+                      );
+                    }, 2500);
                     incTradeCount(symbol);
                     await tg(
                       `🟢 진입: ${symbol} @${Math.round(
@@ -989,6 +1122,7 @@ async function main() {
             typeof vRaw.originalEntry === "number"
               ? Number(vRaw.originalEntry)
               : Number(vRaw.entry) || 0,
+          accFee: typeof vRaw.accFee === "number" ? Number(vRaw.accFee) : 0,
         };
         positions.set(k, v);
       }
@@ -1012,6 +1146,14 @@ async function main() {
     if (typeof (prev as any).realizedToday === "number") {
       realizedToday = Number((prev as any).realizedToday) || 0;
     }
+    if (typeof (prev as any).winsToday === "number")
+      winsToday = Number((prev as any).winsToday) || 0;
+    if (typeof (prev as any).lossesToday === "number")
+      lossesToday = Number((prev as any).lossesToday) || 0;
+    if (typeof (prev as any).grossToday === "number")
+      grossToday = Number((prev as any).grossToday) || 0;
+    if (typeof (prev as any).feeToday === "number")
+      feeToday = Number((prev as any).feeToday) || 0;
   } catch {}
 
   const feed = new UpbitTickerFeed(codes);
@@ -1068,6 +1210,10 @@ async function main() {
         paused,
         realizedToday,
         failureCounts,
+        winsToday,
+        lossesToday,
+        grossToday,
+        feeToday,
       });
       console.log("[AUTOSAVE] persisted", { realizedToday });
     } catch (e) {
@@ -1075,22 +1221,64 @@ async function main() {
     }
   }, autosaveMs);
 
+  // Daily summary (KST) - run every 60s, detect date change
+  let lastSummaryDay = todayStrKST();
+  setInterval(() => {
+    const d = todayStrKST();
+    if (d !== lastSummaryDay) {
+      // 날짜 바뀜 → 이전 날 요약 전송
+      const totalTrades = winsToday + lossesToday;
+      const winRate = totalTrades > 0 ? (winsToday / totalTrades) * 100 : 0;
+      // 상위 실패 사유 3개 추출
+      const failEntries = Object.entries(failureCounts).sort(
+        (a, b) => b[1] - a[1]
+      );
+      const topFails = failEntries
+        .slice(0, 3)
+        .map(([r, c]) => `${r}:${c}`)
+        .join(", ");
+      tg(
+        `📊 Daily Summary (${lastSummaryDay})\n gross=${grossToday.toFixed(
+          0
+        )} fee=${feeToday.toFixed(0)} net=${realizedToday.toFixed(
+          0
+        )}\n wins=${winsToday} losses=${lossesToday} winRate=${winRate.toFixed(
+          1
+        )}%\n fails:${topFails || "-"}`
+      );
+      // 날짜 넘어가기 직전 상태 저장
+      try {
+        const out: Record<string, Pos> = {};
+        positions.forEach((v, k) => (out[k] = { ...v }));
+        const trades: Record<string, number> = {};
+        tradeCounter.forEach((cnt, k) => (trades[k] = cnt));
+        saveState({
+          positions: out as any,
+          tradesToday: trades,
+          paused,
+          realizedToday,
+          failureCounts,
+          winsToday,
+          lossesToday,
+          grossToday,
+          feeToday,
+        });
+      } catch {}
+      // reset counters for new day
+      lastSummaryDay = d;
+      winsToday = 0;
+      lossesToday = 0;
+      grossToday = 0;
+      feeToday = 0;
+      realizedToday = 0;
+    }
+  }, 60_000);
+
   process.on("SIGINT", async () => {
     await tg("👋 종료(SIGINT)");
     try {
       // persist 타입에 딱 맞게 정규화하여 저장
-      const outStrict: Record<
-        string,
-        {
-          entry: number;
-          size: number;
-          invested: number;
-          peak: number;
-          tookTP1: boolean;
-          openedAt: number;
-          bePrice?: number;
-        }
-      > = {};
+      const outStrict: Record<string, any> = {};
       positions.forEach((v, k) => {
         outStrict[k] = {
           entry: Number(v.entry) || 0,
@@ -1099,11 +1287,13 @@ async function main() {
           peak: Number(v.peak ?? v.entry) || 0,
           tookTP1: Boolean(v.tookTP1),
           openedAt: Number(v.openedAt) || Date.now(),
-          // 추가 메타 (백업용)
           stopPrice: typeof v.stopPrice === "number" ? v.stopPrice : undefined,
           initialRiskPct:
             typeof v.initialRiskPct === "number" ? v.initialRiskPct : undefined,
-        } as any;
+          originalEntry:
+            typeof v.originalEntry === "number" ? v.originalEntry : undefined,
+          accFee: typeof v.accFee === "number" ? v.accFee : undefined,
+        };
       });
 
       const tradesTodayObj: Record<string, number> = {};
@@ -1115,6 +1305,10 @@ async function main() {
         paused,
         realizedToday,
         failureCounts,
+        winsToday,
+        lossesToday,
+        grossToday,
+        feeToday,
       });
     } catch {}
     process.exit(0);
@@ -1122,18 +1316,7 @@ async function main() {
   process.on("SIGTERM", async () => {
     await tg("👋 종료(SIGTERM)");
     try {
-      const outStrict: Record<
-        string,
-        {
-          entry: number;
-          size: number;
-          invested: number;
-          peak: number;
-          tookTP1: boolean;
-          openedAt: number;
-          bePrice?: number;
-        }
-      > = {};
+      const outStrict: Record<string, any> = {};
       positions.forEach((v, k) => {
         outStrict[k] = {
           entry: Number(v.entry) || 0,
@@ -1145,7 +1328,10 @@ async function main() {
           stopPrice: typeof v.stopPrice === "number" ? v.stopPrice : undefined,
           initialRiskPct:
             typeof v.initialRiskPct === "number" ? v.initialRiskPct : undefined,
-        } as any;
+          originalEntry:
+            typeof v.originalEntry === "number" ? v.originalEntry : undefined,
+          accFee: typeof v.accFee === "number" ? v.accFee : undefined,
+        };
       });
 
       const tradesTodayObj: Record<string, number> = {};
@@ -1157,6 +1343,10 @@ async function main() {
         paused,
         realizedToday,
         failureCounts,
+        winsToday,
+        lossesToday,
+        grossToday,
+        feeToday,
       });
     } catch {}
     process.exit(0);

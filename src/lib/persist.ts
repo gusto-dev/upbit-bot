@@ -18,12 +18,17 @@ export type SavedState = {
       stopPrice?: number;
       initialRiskPct?: number;
       originalEntry?: number;
+      accFee?: number; // 누적 매수/부분 실현에서 집계된 실제 수수료 (quote 단위)
     }
   >;
   tradesToday: Record<string, number>;
   paused: boolean;
   realizedToday?: number; // 누적 실현손익 (KRW)
   failureCounts?: Record<string, number>;
+  winsToday?: number;
+  lossesToday?: number;
+  grossToday?: number;
+  feeToday?: number;
 };
 
 export function loadState(): SavedState {
@@ -36,11 +41,19 @@ export function loadState(): SavedState {
         paused: false,
         realizedToday: 0,
         failureCounts: {},
+        winsToday: 0,
+        lossesToday: 0,
+        grossToday: 0,
+        feeToday: 0,
       };
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     if (typeof raw.realizedToday !== "number") raw.realizedToday = 0;
     if (typeof raw.failureCounts !== "object" || !raw.failureCounts)
       raw.failureCounts = {};
+    if (typeof raw.winsToday !== "number") raw.winsToday = 0;
+    if (typeof raw.lossesToday !== "number") raw.lossesToday = 0;
+    if (typeof raw.grossToday !== "number") raw.grossToday = 0;
+    if (typeof raw.feeToday !== "number") raw.feeToday = 0;
     return raw;
   } catch {
     return {
@@ -49,6 +62,10 @@ export function loadState(): SavedState {
       paused: false,
       realizedToday: 0,
       failureCounts: {},
+      winsToday: 0,
+      lossesToday: 0,
+      grossToday: 0,
+      feeToday: 0,
     };
   }
 }
