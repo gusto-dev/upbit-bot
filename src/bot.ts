@@ -454,6 +454,15 @@ function getTradeCount(sym: string) {
 
 let _marketsLoaded = false;
 const _upscaleNotified = new Set<string>();
+const _stopFailCooldown: Map<string, number> = new Map(); // symbol -> next allowable sell attempt ts
+
+function inStopCooldown(symbol: string) {
+  const t = _stopFailCooldown.get(symbol) || 0;
+  return Date.now() < t;
+}
+function setStopCooldown(symbol: string, ms: number) {
+  _stopFailCooldown.set(symbol, Date.now() + ms);
+}
 
 async function preflight(symbols: string[]) {
   // Load markets once
@@ -618,6 +627,59 @@ async function marketSell(symbol: string, amt: number) {
   }
 }
 
+async function tryAdaptiveSell(
+  symbol: string,
+  desiredAmt: number,
+  lastPx: number
+) {
+  // 1차 시도
+  let first = await marketSell(symbol, desiredAmt);
+  if (first.ok) return { attempt: 1, sold: desiredAmt, result: first };
+  const reason = first.reason || "";
+  if (!/insufficient_funds/i.test(reason)) {
+    return { attempt: 1, sold: 0, result: first };
+  }
+  // 잔고 재조회 후 가능한 수량으로 재시도
+  try {
+    const bal = await exchange.fetchBalance();
+    const base = symbol.split("/")[0];
+    let avail = safeWalletQty(bal, base);
+    if (avail <= 0) {
+      return { attempt: 2, sold: 0, result: first };
+    }
+    // 약간의 수수료/잔량 버퍼
+    avail *= 0.9995;
+    if (avail <= 0) return { attempt: 2, sold: 0, result: first };
+    // 정밀도 보정
+    const mi: any = getMarketInfo(symbol);
+    const precisionDigits = Number.isInteger(mi?.precision?.amount)
+      ? mi.precision.amount
+      : undefined;
+    if (precisionDigits !== undefined) {
+      avail = parseFloat(avail.toFixed(precisionDigits));
+    }
+    const minAmount = Number(mi?.limits?.amount?.min) || 0;
+    if (minAmount && avail < minAmount) {
+      // 사실상 버릴만한 먼지: 포지션 제거 처리
+      return {
+        attempt: 2,
+        sold: 0,
+        result: { ok: false, reason: "dust-below-min-amount" },
+      } as any;
+    }
+    if (avail <= 0) return { attempt: 2, sold: 0, result: first };
+    const second = await marketSell(symbol, avail);
+    if (second.ok) return { attempt: 2, sold: avail, result: second };
+    return { attempt: 2, sold: 0, result: second };
+  } catch (e: any) {
+    return {
+      attempt: 2,
+      sold: 0,
+      result: { ok: false, reason: e?.message || "adaptive-sell-failed" },
+    };
+  }
+}
+
 // ===================== STRATEGY RUNNER =====================
 async function runner(symbol: string, feed: UpbitTickerFeed) {
   const code = toUpbitCode(symbol);
@@ -702,20 +764,47 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           const activeStop = pos.stopPrice ?? pos.entry * (1 + STOP_LOSS_PCT);
           let fullyExited = false;
           if (lastPx <= activeStop) {
-            const r = await marketSell(symbol, pos.size);
-            if (r.ok) {
-              const refEntry = pos.originalEntry ?? pos.entry;
-              realizedToday += (lastPx - refEntry) * pos.size;
-              positions.delete(symbol);
-              await tg(
-                `❌ 손절: ${symbol} @${Math.round(lastPx)} (${(
-                  ((lastPx - refEntry) / refEntry) *
-                  100
-                ).toFixed(2)}%) stop=${Math.round(activeStop)}`
-              );
-              fullyExited = true;
+            if (inStopCooldown(symbol)) {
+              // 쿨다운 중 → 재시도 지연
             } else {
-              await tg(`❗ 손절 실패: ${symbol} | ${r.reason}`);
+              const adaptive = await tryAdaptiveSell(symbol, pos.size, lastPx);
+              const r = adaptive.result;
+              if (r.ok && adaptive.sold > 0) {
+                const refEntry = pos.originalEntry ?? pos.entry;
+                const realizedPart = (lastPx - refEntry) * adaptive.sold;
+                realizedToday += realizedPart;
+                const remaining = pos.size - adaptive.sold;
+                if (remaining <= pos.size * 0.05 || remaining <= 0) {
+                  positions.delete(symbol);
+                  fullyExited = true;
+                  await tg(
+                    `❌ 손절: ${symbol} @${Math.round(lastPx)} (${(
+                      ((lastPx - refEntry) / refEntry) *
+                      100
+                    ).toFixed(2)}%) sold=${adaptive.sold.toFixed(6)} full-exit`
+                  );
+                } else {
+                  pos.size = remaining;
+                  pos.invested = pos.size * lastPx;
+                  // 부분 손절 후 stop 재배치(보수적): entry 아래로 유지
+                  if (pos.stopPrice && pos.stopPrice > activeStop) {
+                    pos.stopPrice = activeStop;
+                  }
+                  positions.set(symbol, pos);
+                  await tg(
+                    `❌ 부분 손절: ${symbol} @${Math.round(
+                      lastPx
+                    )} 남은=${pos.size.toFixed(6)} sold=${adaptive.sold.toFixed(
+                      6
+                    )}`
+                  );
+                }
+              } else {
+                await tg(`❗ 손절 실패: ${symbol} | ${r.reason}`);
+                if (/insufficient_funds/i.test(r.reason || "")) {
+                  setStopCooldown(symbol, 10_000); // 10초 쿨다운
+                }
+              }
             }
           }
           if (fullyExited) {
@@ -748,22 +837,56 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
           // TP2 (전량 익절) or 트레일
           if (pnlPct >= TP2) {
-            const r = await marketSell(symbol, pos.size);
-            if (r.ok) {
+            const adaptive = await tryAdaptiveSell(symbol, pos.size, lastPx);
+            const r = adaptive.result;
+            if (r.ok && adaptive.sold > 0) {
               const refEntry = pos.originalEntry ?? pos.entry;
-              realizedToday += (lastPx - refEntry) * pos.size;
-              positions.delete(symbol);
-              await tg(`🎯 TP2: ${symbol} 전량 익절`);
+              realizedToday += (lastPx - refEntry) * adaptive.sold;
+              const remaining = pos.size - adaptive.sold;
+              if (remaining <= pos.size * 0.05 || remaining <= 0) {
+                positions.delete(symbol);
+                await tg(
+                  `🎯 TP2: ${symbol} 전량/거의 전량 익절 sold=${adaptive.sold.toFixed(
+                    6
+                  )}`
+                );
+              } else {
+                pos.size = remaining;
+                pos.invested = pos.size * lastPx;
+                positions.set(symbol, pos);
+                await tg(
+                  `🎯 TP2 부분: ${symbol} 남은=${remaining.toFixed(
+                    6
+                  )} sold=${adaptive.sold.toFixed(6)}`
+                );
+              }
             } else {
               await tg(`❗ TP2 실패: ${symbol} | ${r.reason}`);
             }
           } else if ((lastPx - pos.peak) / pos.peak <= TRAIL) {
-            const r = await marketSell(symbol, pos.size);
-            if (r.ok) {
+            const adaptive = await tryAdaptiveSell(symbol, pos.size, lastPx);
+            const r = adaptive.result;
+            if (r.ok && adaptive.sold > 0) {
               const refEntry = pos.originalEntry ?? pos.entry;
-              realizedToday += (lastPx - refEntry) * pos.size;
-              positions.delete(symbol);
-              await tg(`🛑 트레일 스탑: ${symbol} 청산`);
+              realizedToday += (lastPx - refEntry) * adaptive.sold;
+              const remaining = pos.size - adaptive.sold;
+              if (remaining <= pos.size * 0.05 || remaining <= 0) {
+                positions.delete(symbol);
+                await tg(
+                  `🛑 트레일 스탑: ${symbol} 청산 sold=${adaptive.sold.toFixed(
+                    6
+                  )}`
+                );
+              } else {
+                pos.size = remaining;
+                pos.invested = pos.size * lastPx;
+                positions.set(symbol, pos);
+                await tg(
+                  `🛑 트레일 부분: ${symbol} 남은=${remaining.toFixed(
+                    6
+                  )} sold=${adaptive.sold.toFixed(6)}`
+                );
+              }
             } else {
               await tg(`❗ 트레일 실패: ${symbol} | ${r.reason}`);
             }
