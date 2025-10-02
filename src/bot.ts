@@ -453,6 +453,36 @@ function getTradeCount(sym: string) {
 }
 
 let _marketsLoaded = false;
+const _upscaleNotified = new Set<string>();
+
+async function preflight(symbols: string[]) {
+  // Load markets once
+  if (!_marketsLoaded) {
+    try {
+      await exchange.loadMarkets();
+    } catch {}
+    _marketsLoaded = true;
+  }
+  for (const sym of symbols) {
+    const mi: any = getMarketInfo(sym) || {};
+    const minCost = Number(mi?.limits?.cost?.min) || LIVE_MIN_ORDER_KRW;
+    const baseTarget = Math.max(
+      LIVE_MIN_ORDER_KRW,
+      Math.floor(BASE_CAPITAL_KRW * POS_PCT)
+    );
+    const precisionDigits = Number.isInteger(mi?.precision?.amount)
+      ? mi.precision.amount
+      : undefined;
+    const minAmount = Number(mi?.limits?.amount?.min) || 0;
+    const willUpscale = baseTarget < minCost;
+    let msg = `🧪 PRECHECK ${sym} baseTarget=${baseTarget} minCost=${minCost}`;
+    if (willUpscale) msg += ` → upscale to ${minCost}`;
+    msg += ` | minAmount=${minAmount || 0} prec=${precisionDigits ?? "n/a"}`;
+    await tg(msg);
+    if (willUpscale) _upscaleNotified.add(sym);
+  }
+}
+
 async function marketBuy(symbol: string, lastPx: number) {
   if (!_marketsLoaded) {
     try {
@@ -463,7 +493,7 @@ async function marketBuy(symbol: string, lastPx: number) {
   const mi: any = getMarketInfo(symbol);
 
   // 목표 예산(KRW) 산출
-  const targetCost = Math.max(
+  let targetCost = Math.max(
     LIVE_MIN_ORDER_KRW,
     Math.floor(BASE_CAPITAL_KRW * POS_PCT)
   );
@@ -471,10 +501,14 @@ async function marketBuy(symbol: string, lastPx: number) {
   // 마켓 최소 비용/수량 확인 (Upbit는 최소 주문 금액 제한 존재)
   const minCost = Number(mi?.limits?.cost?.min) || LIVE_MIN_ORDER_KRW;
   if (targetCost < minCost) {
-    return {
-      ok: false as const,
-      reason: `cost-below-min (target=${targetCost} < min=${minCost})`,
-    };
+    // Option 2: 자동 상향
+    if (!_upscaleNotified.has(symbol)) {
+      tg(
+        `⚠️ targetCost(${targetCost}) < minCost(${minCost}) → auto upscale for ${symbol}`
+      );
+      _upscaleNotified.add(symbol);
+    }
+    targetCost = minCost;
   }
 
   // ===== 수량 계산 (정밀도/최소비용 고려) =====
@@ -866,6 +900,13 @@ async function main() {
   await tg(
     `🚀 BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`
   );
+
+  // Preflight (시장 최소 조건 확인 및 upscale 통지)
+  try {
+    await preflight(symbols);
+  } catch (e: any) {
+    await tg(`⚠️ PRECHECK 실패: ${e?.message || e}`);
+  }
 
   // 시작 1회 동기화
   await syncPositionsFromWalletOnce(symbols, feed);
