@@ -477,24 +477,52 @@ async function marketBuy(symbol: string, lastPx: number) {
     };
   }
 
-  // 수량 계산 후 라운딩
-  const rawAmount = targetCost / lastPx;
-  const step = mi?.precision?.amount ? Math.pow(10, -mi.precision.amount) : 0;
-  let amount = step ? floorToStep(rawAmount, step) : rawAmount;
+  // ===== 수량 계산 (정밀도/최소비용 고려) =====
+  const rawAmount = targetCost / lastPx; // 희망 base 수량
+  const precisionDigits = Number.isInteger(mi?.precision?.amount)
+    ? mi.precision.amount
+    : undefined;
+  const step =
+    precisionDigits !== undefined ? Math.pow(10, -precisionDigits) : 0;
 
-  // 최소 수량 제한 확인
+  let amount: number;
+  if (precisionDigits !== undefined) {
+    amount = parseFloat(rawAmount.toFixed(precisionDigits));
+  } else if (step) {
+    amount = floorToStep(rawAmount, step);
+  } else {
+    amount = rawAmount;
+  }
+
+  // 만약 라운딩으로 0이 되었으면 최소 단위로 보정
+  if (amount === 0 && precisionDigits !== undefined) {
+    amount = Number(`0.${"0".repeat(Math.max(0, precisionDigits - 1))}1`);
+  }
+
   const minAmount = Number(mi?.limits?.amount?.min) || 0;
   if (minAmount && amount < minAmount) {
-    // minAmount 맞추기 위해 비용 재계산(상향) 시도
     amount = minAmount;
   }
 
-  if (amount <= 0) {
-    return { ok: false as const, reason: "amount-too-small" };
+  // 최소 비용 충족 못 하면 비용을 minCost로 올려 재산출 시도
+  let finalCost = amount * lastPx;
+  if (finalCost < minCost) {
+    amount = minCost / lastPx;
+    if (precisionDigits !== undefined)
+      amount = parseFloat(amount.toFixed(precisionDigits));
+    finalCost = amount * lastPx;
   }
 
-  // 최종 비용 재확인
-  const finalCost = amount * lastPx;
+  // 여전히 0 또는 너무 작은 경우
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return {
+      ok: false as const,
+      reason: `amount-too-small(raw=${rawAmount}, step=${step || "n/a"}, prec=${
+        precisionDigits ?? "n/a"
+      })`,
+    };
+  }
+
   if (finalCost < minCost) {
     return {
       ok: false as const,
