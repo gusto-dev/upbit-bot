@@ -30,6 +30,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const UPBIT_API_KEY = process.env.UPBIT_API_KEY || "";
 const UPBIT_SECRET = process.env.UPBIT_SECRET || "";
+const KILL_SWITCH = bool(process.env.KILL_SWITCH, false); // 실거래 강제 차단 스위치
 
 let BASE_CAPITAL_KRW = clamp(
   num(process.env.BASE_CAPITAL_KRW, 500_000),
@@ -107,6 +108,12 @@ const CANDLE_MIN_REFRESH_MS = clamp(
   60_000
 );
 const AUTOSAVE_MIN = clamp(num(process.env.AUTOSAVE_MIN, 5), 1, 120);
+// 매수 실패 쿨다운(ms)
+const BUY_FAIL_COOLDOWN_MS = clamp(
+  num(process.env.BUY_FAIL_COOLDOWN_MS, 15_000),
+  1_000,
+  300_000
+);
 
 // ===== 추가 사이징/리스크 옵션 =====
 // 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
@@ -163,6 +170,8 @@ console.log("CONFIG", {
   STOP_LOSS_PCT,
   FEE_BPS,
   TOT_EXPOSURE_GUARD_PCT,
+  KILL_SWITCH,
+  BUY_FAIL_COOLDOWN_MS,
 });
 
 // ===================== TYPES/STATE =====================
@@ -215,6 +224,13 @@ const exchange = new ccxt.upbit({
   secret: UPBIT_SECRET || undefined,
   enableRateLimit: true,
 });
+// 타입 제약으로 인한 사후 옵션 설정
+try {
+  (exchange as any).options = {
+    ...((exchange as any).options || {}),
+    createMarketBuyOrderRequiresPrice: false,
+  };
+} catch {}
 
 // ===================== FEES =====================
 // Upbit 기본 수수료 (예: 0.05% = 5 bps) 각 체결금액 기준 양쪽 모두 발생한다고 가정 (시장가/지정가 동일 비율 가정)
@@ -526,6 +542,8 @@ function getTradeCount(sym: string) {
 let _marketsLoaded = false;
 const _upscaleNotified = new Set<string>();
 const _stopFailCooldown: Map<string, number> = new Map(); // symbol -> next allowable sell attempt ts
+// 매수 실패 쿨다운
+const _buyFailCooldown: Map<string, number> = new Map();
 
 function inStopCooldown(symbol: string) {
   const t = _stopFailCooldown.get(symbol) || 0;
@@ -533,6 +551,14 @@ function inStopCooldown(symbol: string) {
 }
 function setStopCooldown(symbol: string, ms: number) {
   _stopFailCooldown.set(symbol, Date.now() + ms);
+}
+
+function inBuyCooldown(symbol: string) {
+  const t = _buyFailCooldown.get(symbol) || 0;
+  return Date.now() < t;
+}
+function setBuyCooldown(symbol: string, ms: number) {
+  _buyFailCooldown.set(symbol, Date.now() + ms);
 }
 
 async function preflight(symbols: string[]) {
@@ -643,7 +669,7 @@ async function marketBuy(symbol: string, lastPx: number) {
     };
   }
 
-  if (MODE === "paper") {
+  if (KILL_SWITCH || MODE === "paper") {
     return { ok: true as const, paper: true as const, amt: Number(amount) };
   }
 
@@ -686,7 +712,8 @@ async function marketBuy(symbol: string, lastPx: number) {
 
 async function marketSell(symbol: string, amt: number) {
   if (amt <= 0) return { ok: false as const, reason: "zero-amt" };
-  if (MODE === "paper") return { ok: true as const, paper: true as const, amt };
+  if (KILL_SWITCH || MODE === "paper")
+    return { ok: true as const, paper: true as const, amt };
   try {
     const o = await exchange.createOrder(symbol, "market", "sell", amt);
     return { ok: true as const, order: o };
@@ -1064,6 +1091,8 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             // 동시 포지션 제한 → 스킵
           } else if (getTradeCount(symbol) >= MAX_TRADES_PER_DAY) {
             // 일일 진입 제한 → 스킵
+          } else if (inBuyCooldown(symbol)) {
+            // 매수 실패 쿨다운 중 → 스킵
           } else {
             // 총 익스포저 가드 확인
             try {
@@ -1131,6 +1160,14 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 } else {
                   await tg(`❗ 진입 실패: ${symbol} | ${r.reason}`);
                   incFail(r.reason);
+                  // 매수 실패 시 쿨다운 적용 (대표적인 실패 사유에 한함)
+                  if (
+                    /amount-too-small|final-cost-below-min|buy-failed/i.test(
+                      r.reason
+                    )
+                  ) {
+                    setBuyCooldown(symbol, BUY_FAIL_COOLDOWN_MS);
+                  }
                 }
               } else {
                 await tg(
