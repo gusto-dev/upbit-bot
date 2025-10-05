@@ -114,6 +114,12 @@ const BUY_FAIL_COOLDOWN_MS = clamp(
   1_000,
   300_000
 );
+// 최소주문금액 여유 버퍼(KRW): 서버 라운딩/수수료 반영 오차 방지용
+const MIN_TOTAL_SAFETY_KRW = clamp(
+  num(process.env.MIN_TOTAL_SAFETY_KRW, 200),
+  0,
+  10_000
+);
 
 // ===== 추가 사이징/리스크 옵션 =====
 // 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
@@ -172,6 +178,7 @@ console.log("CONFIG", {
   TOT_EXPOSURE_GUARD_PCT,
   KILL_SWITCH,
   BUY_FAIL_COOLDOWN_MS,
+  MIN_TOTAL_SAFETY_KRW,
 });
 
 // ===================== TYPES/STATE =====================
@@ -597,7 +604,7 @@ async function marketBuy(symbol: string, lastPx: number) {
   }
   const mi: any = getMarketInfo(symbol);
 
-  // 목표 예산(KRW) 산출
+  // 목표 예산(KRW) 산출 + 안전 버퍼
   let targetCost = plannedEntryCost(symbol);
   if (targetCost < LIVE_MIN_ORDER_KRW) targetCost = LIVE_MIN_ORDER_KRW;
 
@@ -615,7 +622,7 @@ async function marketBuy(symbol: string, lastPx: number) {
   }
 
   // ===== 수량 계산 (정밀도/최소비용 고려) =====
-  const rawAmount = targetCost / lastPx; // 희망 base 수량
+  const rawAmount = (targetCost + MIN_TOTAL_SAFETY_KRW) / lastPx; // 희망 base 수량(안전 버퍼 적용)
   const precisionDigits = Number.isInteger(mi?.precision?.amount)
     ? mi.precision.amount
     : undefined;
@@ -643,8 +650,8 @@ async function marketBuy(symbol: string, lastPx: number) {
 
   // 최소 비용 충족 못 하면 비용을 minCost로 올려 재산출 시도
   let finalCost = amount * lastPx;
-  if (finalCost < minCost) {
-    amount = minCost / lastPx;
+  if (finalCost < minCost + MIN_TOTAL_SAFETY_KRW) {
+    amount = (minCost + MIN_TOTAL_SAFETY_KRW) / lastPx;
     if (precisionDigits !== undefined)
       amount = parseFloat(amount.toFixed(precisionDigits));
     finalCost = amount * lastPx;
@@ -674,39 +681,63 @@ async function marketBuy(symbol: string, lastPx: number) {
   }
 
   try {
-    // Upbit: market buy 시 price 필요 -> amount는 base 수량, price 전달
-    // ccxt 옵션: createMarketBuyOrderRequiresPrice (기본 true)
-    const o = await exchange.createOrder(
+    // 1) 비용(cost) 기반 우선 시도: 안전버퍼 포함한 quote 비용으로 주문
+    const quoteCost = Math.ceil(
+      Math.max(finalCost, minCost) + MIN_TOTAL_SAFETY_KRW
+    );
+    const oCost = await (exchange as any).createOrder(
       symbol,
       "market",
       "buy",
-      amount,
-      lastPx // price hint
+      quoteCost,
+      undefined,
+      { createMarketBuyOrderRequiresPrice: false }
     );
-    return { ok: true as const, order: o, amt: Number(amount) };
+    return { ok: true as const, order: oCost, amt: Number(amount) };
   } catch (e: any) {
-    // 대체 경로: 가격 없이 cost 제공 (ccxt 설정 변경 필요할 수 있음)
-    if (/requires the price/i.test(e?.message || "")) {
+    const msg = String(e?.message || "");
+    // under_min_total_bid일 때 한 번 더 비용을 키워 재시도
+    if (/under_min_total_bid/i.test(msg)) {
       try {
-        // cost 방식: amount 자리에 quote cost 넣는 패턴 (옵션 비활성화 가정)
-        const cost = finalCost;
-        const o2 = await exchange.createOrder(
+        const bumpCost = Math.ceil(minCost + MIN_TOTAL_SAFETY_KRW + 1000);
+        const oBump = await (exchange as any).createOrder(
           symbol,
           "market",
           "buy",
-          cost,
+          bumpCost,
           undefined,
           { createMarketBuyOrderRequiresPrice: false }
         );
-        return { ok: true as const, order: o2, amt: Number(amount) };
+        return { ok: true as const, order: oBump, amt: Number(amount) };
       } catch (e2: any) {
-        return {
-          ok: false as const,
-          reason: e2?.message || "buy-failed-alt",
-        };
+        // 마지막 대안: base 수량 + price 힌트로 시도
+        try {
+          const oBase = await exchange.createOrder(
+            symbol,
+            "market",
+            "buy",
+            amount,
+            lastPx
+          );
+          return { ok: true as const, order: oBase, amt: Number(amount) };
+        } catch (e3: any) {
+          return { ok: false as const, reason: e3?.message || "buy-failed" };
+        }
       }
     }
-    return { ok: false as const, reason: e?.message || "buy-failed" };
+    // 일반 오류: base 수량 + price 힌트로 재시도
+    try {
+      const oBase = await exchange.createOrder(
+        symbol,
+        "market",
+        "buy",
+        amount,
+        lastPx
+      );
+      return { ok: true as const, order: oBase, amt: Number(amount) };
+    } catch (e4: any) {
+      return { ok: false as const, reason: e4?.message || "buy-failed" };
+    }
   }
 }
 
