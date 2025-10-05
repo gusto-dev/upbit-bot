@@ -155,6 +155,36 @@ function plannedEntryCost(symbol: string): number {
   return Math.floor(BASE_CAPITAL_KRW * POS_PCT);
 }
 
+// ===== 불장(강상승) 대응 옵션 =====
+// auto: EMA 갭 기준 자동 감지, on: 항상 불장 모드, off: 사용 안함
+const BULL_MODE = (process.env.BULL_MODE || "auto") as "auto" | "on" | "off";
+// fast>=slow && price가 slow 위로 일정 갭(bps) 이상이면 불장으로 간주
+const BULL_EMA_GAP_BPS = clamp(num(process.env.BULL_EMA_GAP_BPS, 40), 0, 5000);
+// 불장 시 TP1 분할 비율(기본 30%) / 일반 시 기본 50%
+const TP1_SELL_FRAC = clamp(num(process.env.TP1_SELL_FRAC, 0.5), 0.05, 0.95);
+const TP1_SELL_FRAC_BULL = clamp(
+  num(process.env.TP1_SELL_FRAC_BULL, 0.3),
+  0.05,
+  0.95
+);
+// 불장 시 TP2, 트레일, 슬리피지, 동적 스톱 버퍼 상향 여유
+const TP2_BULL = clamp(num(process.env.TP2_BULL, 0.035), TP1 + 0.001, 1);
+const TRAIL_BULL = clamp(num(process.env.TRAIL_BULL, -0.03), -0.5, -0.001);
+const ENTRY_SLIPPAGE_BPS_BULL = clamp(
+  num(process.env.ENTRY_SLIPPAGE_BPS_BULL, 60),
+  1,
+  2000
+);
+const DYN_STOP_BUFFER_BPS_BULL = clamp(
+  num(process.env.DYN_STOP_BUFFER_BPS_BULL, 150),
+  10,
+  5000
+);
+const QUIET_HOUR_BULL_OVERRIDE = bool(
+  process.env.QUIET_HOUR_BULL_OVERRIDE,
+  true
+);
+
 console.log("CONFIG", {
   MODE,
   SYMBOL_CCXT,
@@ -179,6 +209,15 @@ console.log("CONFIG", {
   KILL_SWITCH,
   BUY_FAIL_COOLDOWN_MS,
   MIN_TOTAL_SAFETY_KRW,
+  BULL_MODE,
+  BULL_EMA_GAP_BPS,
+  TP1_SELL_FRAC,
+  TP1_SELL_FRAC_BULL,
+  TP2_BULL,
+  TRAIL_BULL,
+  ENTRY_SLIPPAGE_BPS_BULL,
+  DYN_STOP_BUFFER_BPS_BULL,
+  QUIET_HOUR_BULL_OVERRIDE,
 });
 
 // ===================== TYPES/STATE =====================
@@ -859,7 +898,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
   for (;;) {
     try {
       // 조용시간엔 신규 진입만 막고, 보유포지션 관리는 계속
-      const quiet = inQuietHours();
+      let quiet = inQuietHours();
 
       // 실시간 가격
       const lastPx = feed.get(code);
@@ -898,6 +937,29 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         const fast = last(emaFast, 1)[0] ?? 0;
         const slow = last(emaSlow, 1)[0] ?? 0;
 
+        // 불장 감지
+        let bullBias = false;
+        if (BULL_MODE === "on") bullBias = true;
+        else if (BULL_MODE === "auto") {
+          const gapBps = slow > 0 ? ((lastPx - slow) / slow) * 10000 : 0;
+          bullBias =
+            (USE_REGIME_FILTER ? fast >= slow : true) &&
+            gapBps >= BULL_EMA_GAP_BPS;
+        }
+        // 불장에서 조용시간 무시 옵션
+        if (bullBias && QUIET_HOUR_BULL_OVERRIDE) quiet = false;
+
+        // 불장/일반 별 파라미터 활성값
+        const tp1SellFracActive = bullBias ? TP1_SELL_FRAC_BULL : TP1_SELL_FRAC;
+        const tp2Active = bullBias ? TP2_BULL : TP2;
+        const activeTrail = bullBias ? TRAIL_BULL : TRAIL;
+        const activeDynStopBps = bullBias
+          ? DYN_STOP_BUFFER_BPS_BULL
+          : DYN_STOP_BUFFER_BPS;
+        const slipAllowedBps = bullBias
+          ? ENTRY_SLIPPAGE_BPS_BULL
+          : ENTRY_SLIPPAGE_BPS;
+
         // 직전 N봉 고가 (현재 봉 제외)
         const lookback = Math.max(2, BREAKOUT_LOOKBACK + 1);
         const highsForHH = highs.slice(-lookback, -1);
@@ -915,7 +977,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
           // 동적 / 기본 손절 갱신
           if (USE_DYNAMIC_STOP) {
-            const buffer = pos.entry * (DYN_STOP_BUFFER_BPS / 10000);
+            const buffer = pos.entry * (activeDynStopBps / 10000);
             const candidate = pos.peak - buffer;
             if (!pos.stopPrice || candidate > pos.stopPrice) {
               // stop은 entry보다 아래로 (롱 기준) 너무 올라가지 않도록 (진입 직후 peak=entry 상황 보호)
@@ -994,7 +1056,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
           // TP1 (절반 익절)
           if (!pos.tookTP1 && pnlPct >= TP1) {
-            const sellAmt = pos.size * 0.5;
+            const sellAmt = pos.size * tp1SellFracActive;
             const r = await marketSell(symbol, sellAmt);
             if (r.ok) {
               pos.size -= sellAmt;
@@ -1029,7 +1091,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           }
 
           // TP2 (전량 익절) or 트레일
-          if (pnlPct >= TP2) {
+          if (pnlPct >= tp2Active) {
             const adaptive = await tryAdaptiveSell(symbol, pos.size, lastPx);
             const r = adaptive.result;
             if (r.ok && adaptive.sold > 0) {
@@ -1071,7 +1133,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             } else {
               await tg(`❗ TP2 실패: ${symbol} | ${r.reason}`);
             }
-          } else if ((lastPx - pos.peak) / pos.peak <= TRAIL) {
+          } else if ((lastPx - pos.peak) / pos.peak <= activeTrail) {
             const adaptive = await tryAdaptiveSell(symbol, pos.size, lastPx);
             const r = adaptive.result;
             if (r.ok && adaptive.sold > 0) {
@@ -1155,7 +1217,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               // 슬리피지 제한
               const ref = tClose || lastPx;
               const slip = ((lastPx - ref) / ref) * 10000;
-              if (slip <= ENTRY_SLIPPAGE_BPS) {
+              if (slip <= slipAllowedBps) {
                 const r = await marketBuy(symbol, lastPx);
                 if (r.ok) {
                   const size: number = Number(r.amt);
