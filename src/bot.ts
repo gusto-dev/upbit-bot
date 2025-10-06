@@ -161,6 +161,30 @@ function plannedEntryCost(symbol: string): number {
 const BULL_MODE = (process.env.BULL_MODE || "auto") as "auto" | "on" | "off";
 // fast>=slow && price가 slow 위로 일정 갭(bps) 이상이면 불장으로 간주
 const BULL_EMA_GAP_BPS = clamp(num(process.env.BULL_EMA_GAP_BPS, 40), 0, 5000);
+// 불장 토글 안정화: 히스테리시스(진입/이탈 임계)와 최소 유지 시간
+const BULL_EMA_GAP_ENTER_BPS = clamp(
+  num(process.env.BULL_EMA_GAP_ENTER_BPS, BULL_EMA_GAP_BPS),
+  0,
+  10000
+);
+const BULL_EMA_GAP_EXIT_BPS = clamp(
+  num(
+    process.env.BULL_EMA_GAP_EXIT_BPS,
+    Math.max(0, BULL_EMA_GAP_ENTER_BPS - 15)
+  ),
+  0,
+  10000
+);
+const BULL_MIN_HOLD_SEC = clamp(
+  num(process.env.BULL_MIN_HOLD_SEC, 300),
+  0,
+  86400
+);
+const FLAT_MIN_HOLD_SEC = clamp(
+  num(process.env.FLAT_MIN_HOLD_SEC, 300),
+  0,
+  86400
+);
 // 불장 시 TP1 분할 비율(기본 30%) / 일반 시 기본 50%
 const TP1_SELL_FRAC = clamp(num(process.env.TP1_SELL_FRAC, 0.5), 0.05, 0.95);
 const TP1_SELL_FRAC_BULL = clamp(
@@ -273,6 +297,10 @@ console.log("CONFIG", {
   MIN_TOTAL_SAFETY_KRW,
   BULL_MODE,
   BULL_EMA_GAP_BPS,
+  BULL_EMA_GAP_ENTER_BPS,
+  BULL_EMA_GAP_EXIT_BPS,
+  BULL_MIN_HOLD_SEC,
+  FLAT_MIN_HOLD_SEC,
   TP1_SELL_FRAC,
   TP1_SELL_FRAC_BULL,
   TP2_BULL,
@@ -1037,14 +1065,48 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
         const fast = last(emaFast, 1)[0] ?? 0;
         const slow = last(emaSlow, 1)[0] ?? 0;
 
-        // 불장 감지
+        // 불장 감지 (히스테리시스 + 최소 유지시간)
         let bullBias = false;
         if (BULL_MODE === "on") bullBias = true;
         else if (BULL_MODE === "auto") {
           const gapBps = slow > 0 ? ((lastPx - slow) / slow) * 10000 : 0;
-          bullBias =
-            (USE_REGIME_FILTER ? fast >= slow : true) &&
-            gapBps >= BULL_EMA_GAP_BPS;
+          const prev = _symbolBullBias.get(symbol) ?? false;
+          let next = prev;
+          const nowSec = Math.floor(Date.now() / 1000);
+          const stateKey = `${symbol}::bullT`;
+          const flatKey = `${symbol}::flatT`;
+          // @ts-ignore - augment state store on positions map for simple key-value
+          const store: any = positions as any;
+          const lastBullTs: number = store[stateKey] || 0;
+          const lastFlatTs: number = store[flatKey] || 0;
+
+          const inUptrend = USE_REGIME_FILTER ? fast >= slow : true;
+          if (!prev) {
+            // 평상 상태 → 불장 진입 조건: 상향 추세 + enter 임계 초과 + 평상 최소 유지 충족
+            const flatHeldOk = lastFlatTs
+              ? nowSec - lastFlatTs >= FLAT_MIN_HOLD_SEC
+              : true;
+            if (inUptrend && gapBps >= BULL_EMA_GAP_ENTER_BPS && flatHeldOk) {
+              next = true;
+              store[stateKey] = nowSec;
+            } else {
+              next = false;
+              if (!lastFlatTs) store[flatKey] = nowSec;
+            }
+          } else {
+            // 불장 상태 → 이탈 조건: 내려온 추세 또는 exit 임계 미만 + 불장 최소 유지 충족
+            const bullHeldOk = lastBullTs
+              ? nowSec - lastBullTs >= BULL_MIN_HOLD_SEC
+              : false;
+            if (bullHeldOk && (!inUptrend || gapBps < BULL_EMA_GAP_EXIT_BPS)) {
+              next = false;
+              store[flatKey] = nowSec;
+            } else {
+              next = true;
+              if (!lastBullTs) store[stateKey] = nowSec;
+            }
+          }
+          bullBias = next;
         }
         // 불장 전환 이벤트 기반 알림 (전역 집계 기준: 하나라도 불장이면 불장으로 간주)
         _symbolBullBias.set(symbol, bullBias);
