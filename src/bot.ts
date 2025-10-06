@@ -4,6 +4,7 @@ import "dotenv/config";
 import ccxt from "ccxt";
 import { UpbitTickerFeed } from "./lib/wsTicker";
 import { loadState, saveState } from "./lib/persist";
+import { SimpleNewsSentiment } from "./lib/news";
 
 // ===================== ENV (Validated) =====================
 function num(v: any, d: number) {
@@ -211,6 +212,34 @@ const MAX_BREAKOUT_EXTENSION_BPS = clamp(
   0,
   5000
 );
+
+// ===== 뉴스/심리 필터 (선택) =====
+const USE_NEWS_FILTER = bool(process.env.USE_NEWS_FILTER, false);
+const NEWS_FEEDS = (process.env.NEWS_FEEDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const NEWS_NEGATIVE_KWS = (
+  process.env.NEWS_NEGATIVE_KWS ||
+  "급락,하락,규제,해킹,보이스피싱,점검,중단,상장폐지,의혹"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const NEWS_WINDOW_MIN = clamp(num(process.env.NEWS_WINDOW_MIN, 60), 5, 720);
+const NEWS_BLOCK_IF_NEGATIVE_COUNT = clamp(
+  num(process.env.NEWS_BLOCK_IF_NEGATIVE_COUNT, 3),
+  1,
+  50
+);
+const NEWS_REFRESH_MIN = clamp(num(process.env.NEWS_REFRESH_MIN, 5), 1, 120);
+// 중복 선언 방지: 위에서 정의된 경우 재선언하지 않음
+// NEWS_FILTER_LOG_ONLY는 이전에 선언되어 있음
+const NEWS_FILTER_DISABLE_IN_BULL = bool(
+  process.env.NEWS_FILTER_DISABLE_IN_BULL,
+  true
+);
+const NEWS_FILTER_LOG_ONLY = bool(process.env.NEWS_FILTER_LOG_ONLY, false);
 // 불장 시 더 큰 확장을 허용(완화)
 const MAX_BREAKOUT_EXTENSION_BPS_BULL = clamp(
   num(process.env.MAX_BREAKOUT_EXTENSION_BPS_BULL, 80),
@@ -257,6 +286,12 @@ console.log("CONFIG", {
   HOLD_ABOVE_BREAKOUT_MS_BULL,
   MAX_BREAKOUT_EXTENSION_BPS,
   MAX_BREAKOUT_EXTENSION_BPS_BULL,
+  USE_NEWS_FILTER,
+  NEWS_WINDOW_MIN,
+  NEWS_BLOCK_IF_NEGATIVE_COUNT,
+  NEWS_REFRESH_MIN,
+  NEWS_FILTER_LOG_ONLY,
+  NEWS_FILTER_DISABLE_IN_BULL,
 });
 
 // ===================== TYPES/STATE =====================
@@ -429,6 +464,21 @@ function getMarketInfo(symbol: string): { precision?: { amount?: number } } {
   return (m || {}) as { precision?: { amount?: number } };
 }
 
+function normalizeSellAmount(symbol: string, amt: number): number {
+  if (!Number.isFinite(amt) || amt <= 0) return 0;
+  const mi: any = getMarketInfo(symbol);
+  const precisionDigits = Number.isInteger(mi?.precision?.amount)
+    ? mi.precision.amount
+    : undefined;
+  const step =
+    precisionDigits !== undefined ? Math.pow(10, -precisionDigits) : 0;
+  let out = amt;
+  if (step > 0) out = floorToStep(out, step); // floor to avoid over-selling
+  // Avoid negative zero
+  if (!Number.isFinite(out) || out <= 0) return 0;
+  return out;
+}
+
 // 캔들/지표
 async function fetchCandles(
   symbol: string,
@@ -487,6 +537,14 @@ function last<T>(arr: T[], n = 1) {
 // ===================== SYNC (지갑↔포지션) =====================
 const _noWalletStrike: Map<string, number> = new Map();
 let _syncLock = false;
+// 뉴스 필터 전역 상태
+let globalNewsRestrict = false;
+let newsLastReason = "";
+let _newsFilter: SimpleNewsSentiment | null = null;
+// 심볼별 불장 상태와 전역 집계 불장 상태(알림 전환용)
+const _symbolBullBias: Map<string, boolean> = new Map();
+let _prevAggregateBull: boolean | null = null;
+let _lastBullEventTs = 0;
 
 async function syncPositionsFromWalletOnce(
   symbols: string[],
@@ -822,7 +880,8 @@ async function marketBuy(symbol: string, lastPx: number) {
 }
 
 async function marketSell(symbol: string, amt: number) {
-  if (amt <= 0) return { ok: false as const, reason: "zero-amt" };
+  amt = normalizeSellAmount(symbol, amt);
+  if (amt <= 0) return { ok: false as const, reason: "zero-amt-or-precision" };
   if (KILL_SWITCH || MODE === "paper")
     return { ok: true as const, paper: true as const, amt };
   try {
@@ -987,6 +1046,35 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             (USE_REGIME_FILTER ? fast >= slow : true) &&
             gapBps >= BULL_EMA_GAP_BPS;
         }
+        // 불장 전환 이벤트 기반 알림 (전역 집계 기준: 하나라도 불장이면 불장으로 간주)
+        _symbolBullBias.set(symbol, bullBias);
+        const anyBull = Array.from(_symbolBullBias.values()).some(Boolean);
+        if (_prevAggregateBull === null) {
+          _prevAggregateBull = anyBull;
+        } else if (_prevAggregateBull !== anyBull) {
+          const now = Date.now();
+          if (now - _lastBullEventTs > 2000) {
+            // 2초 디바운스
+            if (anyBull) {
+              if (NEWS_FILTER_DISABLE_IN_BULL && USE_NEWS_FILTER) {
+                await tg(
+                  "🟢 불장 진입: 뉴스 필터 자동 비활성 (신규 진입 제한 해제)"
+                );
+              } else {
+                await tg("🟢 불장 진입");
+              }
+            } else {
+              if (NEWS_FILTER_DISABLE_IN_BULL && USE_NEWS_FILTER) {
+                await tg("⚪ 불장 종료: 뉴스 필터 재활성");
+              } else {
+                await tg("⚪ 불장 종료");
+              }
+            }
+            _lastBullEventTs = now;
+          }
+          _prevAggregateBull = anyBull;
+        }
+
         // 불장에서 조용시간 무시 옵션
         if (bullBias && QUIET_HOUR_BULL_OVERRIDE) quiet = false;
 
@@ -1100,7 +1188,10 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
           // TP1 (절반 익절)
           if (!pos.tookTP1 && pnlPct >= TP1) {
-            const sellAmt = pos.size * tp1SellFracActive;
+            const sellAmt = normalizeSellAmount(
+              symbol,
+              pos.size * tp1SellFracActive
+            );
             const r = await marketSell(symbol, sellAmt);
             if (r.ok) {
               pos.size -= sellAmt;
@@ -1123,11 +1214,13 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               if (net >= 0) winsToday++;
               else lossesToday++;
               await tg(
-                `✅ TP1: ${symbol} 50% 익절 | 잔여=${pos.size.toFixed(
-                  6
-                )}\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
+                `✅ TP1: ${symbol} ${(tp1SellFracActive * 100).toFixed(
                   0
-                )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
+                )}% 익절 | 잔여=${pos.size.toFixed(6)}\n gross=${gross.toFixed(
+                  0
+                )} fee=${fee.toFixed(0)} net=${net.toFixed(0)} cum=${Math.round(
+                  realizedToday
+                )}`
               );
             } else {
               await tg(`❗ TP1 실패: ${symbol} | ${r.reason}`);
@@ -1224,6 +1317,25 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
         // ====== 신규 진입 ======
         if (!inPos && !quiet && canEnterByLossLimit()) {
+          // 뉴스 필터: 시장 부정 헤드라인 다수일 때 신규 진입 보류 (불장 시 자동 비활성 옵션 지원)
+          const newsFilterActiveNow =
+            USE_NEWS_FILTER && !(bullBias && NEWS_FILTER_DISABLE_IN_BULL);
+          if (newsFilterActiveNow && globalNewsRestrict) {
+            if (NEWS_FILTER_LOG_ONLY) {
+              await tg(
+                `📰 [로그전용] 뉴스 필터 적중(진입 허용): ${symbol} | ${
+                  newsLastReason || "-"
+                }`
+              );
+            } else {
+              incFail("news-restrict");
+              await tg(
+                `📰 뉴스 필터로 진입 보류: ${symbol} | ${newsLastReason || "-"}`
+              );
+              await sleep(1000);
+              continue;
+            }
+          }
           if (Array.from(positions.keys()).length >= MAX_CONCURRENT_POS) {
             // 동시 포지션 제한 → 스킵
           } else if (getTradeCount(symbol) >= MAX_TRADES_PER_DAY) {
@@ -1438,6 +1550,27 @@ async function main() {
 
   const feed = new UpbitTickerFeed(codes);
   feed.connect();
+
+  // 뉴스 필터 초기화 및 주기 새로고침
+  if (USE_NEWS_FILTER && NEWS_FEEDS.length) {
+    _newsFilter = new SimpleNewsSentiment(NEWS_FEEDS, {
+      timeWindowMs: NEWS_WINDOW_MIN * 60_000,
+      negativeKeywords: NEWS_NEGATIVE_KWS,
+      blockIfNegativeCount: NEWS_BLOCK_IF_NEGATIVE_COUNT,
+    });
+    const refresh = async () => {
+      try {
+        await _newsFilter!.refreshNow();
+        globalNewsRestrict = _newsFilter!.shouldRestrict();
+        newsLastReason = _newsFilter!.getLastReason();
+      } catch {
+        // ignore
+      }
+    };
+    // 즉시 1회 + 주기 실행
+    await refresh();
+    setInterval(refresh, Math.max(1, NEWS_REFRESH_MIN) * 60_000);
+  }
 
   console.log(
     `BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`
