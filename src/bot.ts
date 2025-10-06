@@ -185,6 +185,39 @@ const QUIET_HOUR_BULL_OVERRIDE = bool(
   true
 );
 
+// ===== 정교한 진입 게이트(손절 빈도 감소 목적) =====
+// 이전 완성봉 종가가 돌파선(hh+tol) 위에서 마감되어야 진입 허용
+const REQUIRE_BREAKOUT_CLOSE = bool(process.env.REQUIRE_BREAKOUT_CLOSE, true);
+// 불장 시에는 완화할 수 있는 별도 스위치(기본 false=완화)
+const REQUIRE_BREAKOUT_CLOSE_BULL = bool(
+  process.env.REQUIRE_BREAKOUT_CLOSE_BULL,
+  false
+);
+// 가격이 돌파선 위에서 최소 유지되어야 진입 (ms), 0이면 비활성화
+const HOLD_ABOVE_BREAKOUT_MS = clamp(
+  num(process.env.HOLD_ABOVE_BREAKOUT_MS, 1500),
+  0,
+  60_000
+);
+// 불장 시 유지시간을 더 짧게(완화)
+const HOLD_ABOVE_BREAKOUT_MS_BULL = clamp(
+  num(process.env.HOLD_ABOVE_BREAKOUT_MS_BULL, 500),
+  0,
+  60_000
+);
+// 돌파선 대비 과도한 확장 시 진입 금지 (bps). 0이면 비활성화
+const MAX_BREAKOUT_EXTENSION_BPS = clamp(
+  num(process.env.MAX_BREAKOUT_EXTENSION_BPS, 0),
+  0,
+  5000
+);
+// 불장 시 더 큰 확장을 허용(완화)
+const MAX_BREAKOUT_EXTENSION_BPS_BULL = clamp(
+  num(process.env.MAX_BREAKOUT_EXTENSION_BPS_BULL, 80),
+  0,
+  10000
+);
+
 console.log("CONFIG", {
   MODE,
   SYMBOL_CCXT,
@@ -218,6 +251,12 @@ console.log("CONFIG", {
   ENTRY_SLIPPAGE_BPS_BULL,
   DYN_STOP_BUFFER_BPS_BULL,
   QUIET_HOUR_BULL_OVERRIDE,
+  REQUIRE_BREAKOUT_CLOSE,
+  REQUIRE_BREAKOUT_CLOSE_BULL,
+  HOLD_ABOVE_BREAKOUT_MS,
+  HOLD_ABOVE_BREAKOUT_MS_BULL,
+  MAX_BREAKOUT_EXTENSION_BPS,
+  MAX_BREAKOUT_EXTENSION_BPS_BULL,
 });
 
 // ===================== TYPES/STATE =====================
@@ -590,6 +629,8 @@ const _upscaleNotified = new Set<string>();
 const _stopFailCooldown: Map<string, number> = new Map(); // symbol -> next allowable sell attempt ts
 // 매수 실패 쿨다운
 const _buyFailCooldown: Map<string, number> = new Map();
+// 돌파선 상단 유지 시간 체크를 위한 심볼별 타임스탬프
+const _holdAboveBreakoutSince: Map<string, number> = new Map();
 
 function inStopCooldown(symbol: string) {
   const t = _stopFailCooldown.get(symbol) || 0;
@@ -982,6 +1023,9 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             if (!pos.stopPrice || candidate > pos.stopPrice) {
               // stop은 entry보다 아래로 (롱 기준) 너무 올라가지 않도록 (진입 직후 peak=entry 상황 보호)
               pos.stopPrice = Math.min(candidate, pos.peak * 0.9995);
+            } else {
+              // 돌파 조건이 깨지면 타임스탬프 초기화
+              _holdAboveBreakoutSince.delete(symbol);
             }
             if (pos.tookTP1 && DYN_STOP_TIGHTEN_AFTER_TP1 && pos.stopPrice) {
               const tighten = pos.entry * 0.002; // 0.2% tighten
@@ -1211,9 +1255,54 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             } catch {}
             const regimeOk = !USE_REGIME_FILTER || fast >= slow;
             const tol = hh * (BREAKOUT_TOL_BPS / 10000);
-            const breakoutOk = lastPx >= hh + tol;
+            const breakoutLine = hh + tol;
+            const breakoutOk = lastPx >= breakoutLine;
 
-            if (regimeOk && breakoutOk) {
+            // 이전 봉 종가가 돌파선 위로 마감해야 하는 옵션 (불장 완화 지원)
+            let closeFilterOk = true;
+            const requireCloseActive = bullBias
+              ? REQUIRE_BREAKOUT_CLOSE_BULL
+              : REQUIRE_BREAKOUT_CLOSE;
+            if (requireCloseActive) {
+              const prevCandle: Candle | undefined = last(candles, 2)[0];
+              const prevClose = prevCandle ? Number(prevCandle[4]) : 0;
+              closeFilterOk = prevClose > breakoutLine;
+            }
+
+            // 과도한 확장 제한 (돌파선 대비 확장 bps 상한), 불장에선 완화
+            let extensionOk = true;
+            const maxExtBpsActive = bullBias
+              ? MAX_BREAKOUT_EXTENSION_BPS_BULL
+              : MAX_BREAKOUT_EXTENSION_BPS;
+            if (maxExtBpsActive > 0 && breakoutOk) {
+              const extBps =
+                breakoutLine > 0
+                  ? ((lastPx - breakoutLine) / breakoutLine) * 10000
+                  : 0;
+              extensionOk = extBps <= maxExtBpsActive;
+              if (!extensionOk) incFail("over-extended");
+            }
+
+            if (regimeOk && breakoutOk && closeFilterOk && extensionOk) {
+              // 돌파선 상단 유지 시간 게이트 (불장에선 완화)
+              const holdMsActive = bullBias
+                ? HOLD_ABOVE_BREAKOUT_MS_BULL
+                : HOLD_ABOVE_BREAKOUT_MS;
+              if (holdMsActive > 0) {
+                const hts = _holdAboveBreakoutSince.get(symbol) || 0;
+                const now = Date.now();
+                if (hts === 0) {
+                  _holdAboveBreakoutSince.set(symbol, now);
+                  await sleep(300); // 짧은 안정 대기
+                  continue; // 다음 루프에서 다시 평가
+                } else if (now - hts < holdMsActive) {
+                  await sleep(300);
+                  continue;
+                }
+              } else {
+                // 비활성화면 타임스탬프 초기화
+                _holdAboveBreakoutSince.delete(symbol);
+              }
               // 슬리피지 제한
               const ref = tClose || lastPx;
               const slip = ((lastPx - ref) / ref) * 10000;
