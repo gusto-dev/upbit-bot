@@ -132,6 +132,12 @@ const MIN_GAP_BETWEEN_ENTRIES_MIN = clamp(
   0,
   120
 );
+// 쿨다운 알림 최소 간격(분)
+const COOLDOWN_NOTICE_MIN = clamp(
+  num(process.env.COOLDOWN_NOTICE_MIN, 5),
+  1,
+  1440
+);
 
 // ===== 추가 사이징/리스크 옵션 =====
 // 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
@@ -333,6 +339,7 @@ console.log("CONFIG", {
   NEWS_FILTER_DISABLE_IN_BULL,
   STOP_AFTER_STOP_COOLDOWN_MIN,
   MIN_GAP_BETWEEN_ENTRIES_MIN,
+  COOLDOWN_NOTICE_MIN,
 });
 
 // ===================== TYPES/STATE =====================
@@ -589,6 +596,9 @@ let _lastBullEventTs = 0;
 // 손절/진입 타임스탬프 추적
 const _lastStopAt: Map<string, number> = new Map();
 const _lastEntryAt: Map<string, number> = new Map();
+// 쿨다운 알림 타임스탬프 추적 (스팸 방지)
+const _lastStopCooldownNoticeAt: Map<string, number> = new Map();
+const _lastEntryGapNoticeAt: Map<string, number> = new Map();
 
 function canEnterByStopCooldown(symbol: string) {
   if (STOP_AFTER_STOP_COOLDOWN_MIN <= 0) return true;
@@ -599,6 +609,16 @@ function canEnterByMinGap(symbol: string) {
   if (MIN_GAP_BETWEEN_ENTRIES_MIN <= 0) return true;
   const last = _lastEntryAt.get(symbol) || 0;
   return Date.now() - last >= MIN_GAP_BETWEEN_ENTRIES_MIN * 60_000;
+}
+
+function shouldNotifyCooldown(map: Map<string, number>, symbol: string) {
+  const now = Date.now();
+  const last = map.get(symbol) || 0;
+  if (last === 0 || now - last >= COOLDOWN_NOTICE_MIN * 60_000) {
+    map.set(symbol, now);
+    return true;
+  }
+  return false;
 }
 
 async function syncPositionsFromWalletOnce(
@@ -1434,15 +1454,19 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           } else if (inBuyCooldown(symbol)) {
             // 매수 실패 쿨다운 중 → 스킵
           } else if (!canEnterByStopCooldown(symbol)) {
-            await tg(
-              `⏳ 손절 후 쿨다운: ${symbol} ${STOP_AFTER_STOP_COOLDOWN_MIN}분 대기`
-            );
+            if (shouldNotifyCooldown(_lastStopCooldownNoticeAt, symbol)) {
+              await tg(
+                `⏳ 손절 후 쿨다운: ${symbol} ${STOP_AFTER_STOP_COOLDOWN_MIN}분 대기`
+              );
+            }
             await sleep(300);
             continue;
           } else if (!canEnterByMinGap(symbol)) {
-            await tg(
-              `⏳ 연속 진입 간격 유지: ${symbol} ${MIN_GAP_BETWEEN_ENTRIES_MIN}분 대기`
-            );
+            if (shouldNotifyCooldown(_lastEntryGapNoticeAt, symbol)) {
+              await tg(
+                `⏳ 연속 진입 간격 유지: ${symbol} ${MIN_GAP_BETWEEN_ENTRIES_MIN}분 대기`
+              );
+            }
             await sleep(300);
             continue;
           } else {
