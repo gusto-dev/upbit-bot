@@ -121,6 +121,17 @@ const MIN_TOTAL_SAFETY_KRW = clamp(
   0,
   10_000
 );
+// 손절 후 재진입 쿨다운(분) 및 연속 진입 최소 간격(분)
+const STOP_AFTER_STOP_COOLDOWN_MIN = clamp(
+  num(process.env.STOP_AFTER_STOP_COOLDOWN_MIN, 0),
+  0,
+  120
+);
+const MIN_GAP_BETWEEN_ENTRIES_MIN = clamp(
+  num(process.env.MIN_GAP_BETWEEN_ENTRIES_MIN, 0),
+  0,
+  120
+);
 
 // ===== 추가 사이징/리스크 옵션 =====
 // 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
@@ -320,6 +331,8 @@ console.log("CONFIG", {
   NEWS_REFRESH_MIN,
   NEWS_FILTER_LOG_ONLY,
   NEWS_FILTER_DISABLE_IN_BULL,
+  STOP_AFTER_STOP_COOLDOWN_MIN,
+  MIN_GAP_BETWEEN_ENTRIES_MIN,
 });
 
 // ===================== TYPES/STATE =====================
@@ -573,6 +586,20 @@ let _newsFilter: SimpleNewsSentiment | null = null;
 const _symbolBullBias: Map<string, boolean> = new Map();
 let _prevAggregateBull: boolean | null = null;
 let _lastBullEventTs = 0;
+// 손절/진입 타임스탬프 추적
+const _lastStopAt: Map<string, number> = new Map();
+const _lastEntryAt: Map<string, number> = new Map();
+
+function canEnterByStopCooldown(symbol: string) {
+  if (STOP_AFTER_STOP_COOLDOWN_MIN <= 0) return true;
+  const last = _lastStopAt.get(symbol) || 0;
+  return Date.now() - last >= STOP_AFTER_STOP_COOLDOWN_MIN * 60_000;
+}
+function canEnterByMinGap(symbol: string) {
+  if (MIN_GAP_BETWEEN_ENTRIES_MIN <= 0) return true;
+  const last = _lastEntryAt.get(symbol) || 0;
+  return Date.now() - last >= MIN_GAP_BETWEEN_ENTRIES_MIN * 60_000;
+}
 
 async function syncPositionsFromWalletOnce(
   symbols: string[],
@@ -1209,6 +1236,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 if (remaining <= pos.size * 0.05 || remaining <= 0) {
                   positions.delete(symbol);
                   fullyExited = true;
+                  _lastStopAt.set(symbol, Date.now());
                   await tg(
                     `❌ 손절: ${symbol} @${Math.round(lastPx)} (${pct.toFixed(
                       2
@@ -1225,6 +1253,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                     pos.stopPrice = activeStop;
                   }
                   positions.set(symbol, pos);
+                  _lastStopAt.set(symbol, Date.now());
                   await tg(
                     `❌ 부분 손절: ${symbol} @${Math.round(
                       lastPx
@@ -1404,6 +1433,18 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             // 일일 진입 제한 → 스킵
           } else if (inBuyCooldown(symbol)) {
             // 매수 실패 쿨다운 중 → 스킵
+          } else if (!canEnterByStopCooldown(symbol)) {
+            await tg(
+              `⏳ 손절 후 쿨다운: ${symbol} ${STOP_AFTER_STOP_COOLDOWN_MIN}분 대기`
+            );
+            await sleep(300);
+            continue;
+          } else if (!canEnterByMinGap(symbol)) {
+            await tg(
+              `⏳ 연속 진입 간격 유지: ${symbol} ${MIN_GAP_BETWEEN_ENTRIES_MIN}분 대기`
+            );
+            await sleep(300);
+            continue;
           } else {
             // 총 익스포저 가드 확인
             try {
@@ -1507,6 +1548,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                       );
                     }, 2500);
                     incTradeCount(symbol);
+                    _lastEntryAt.set(symbol, Date.now());
                     await tg(
                       `🟢 진입: ${symbol} @${Math.round(
                         lastPx
