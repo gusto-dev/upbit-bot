@@ -288,6 +288,23 @@ const MAX_BREAKOUT_EXTENSION_BPS_BULL = clamp(
   10000
 );
 
+// ===== 추가 필터: 상위 시간대 정합, 변동성 가드(ATR), 과매수(RSI), 이중 종가 확인 =====
+const USE_HTF_FILTER = bool(process.env.USE_HTF_FILTER, true);
+const HTF_TF = process.env.HTF_TF || "15m";
+const HTF_EMA_FAST = clamp(num(process.env.HTF_EMA_FAST, 20), 2, 500);
+const HTF_EMA_SLOW = clamp(num(process.env.HTF_EMA_SLOW, 60), 3, 1000);
+const HTF_GAP_BPS = clamp(num(process.env.HTF_GAP_BPS, 20), 0, 10000);
+const ATR_PERIOD = clamp(num(process.env.ATR_PERIOD, 14), 2, 200);
+const ATR_MAX_PCT = clamp(num(process.env.ATR_MAX_PCT, 0.02), 0, 1);
+const RSI_PERIOD = clamp(num(process.env.RSI_PERIOD, 14), 2, 200);
+const RSI_OVERBOUGHT = clamp(num(process.env.RSI_OVERBOUGHT, 72), 0, 100);
+const RSI_OVERBOUGHT_BULL = clamp(
+  num(process.env.RSI_OVERBOUGHT_BULL, 78),
+  0,
+  100
+);
+const REQUIRE_DOUBLE_CLOSE = bool(process.env.REQUIRE_DOUBLE_CLOSE, false);
+
 console.log("CONFIG", {
   MODE,
   SYMBOL_CCXT,
@@ -331,6 +348,17 @@ console.log("CONFIG", {
   HOLD_ABOVE_BREAKOUT_MS_BULL,
   MAX_BREAKOUT_EXTENSION_BPS,
   MAX_BREAKOUT_EXTENSION_BPS_BULL,
+  USE_HTF_FILTER,
+  HTF_TF,
+  HTF_EMA_FAST,
+  HTF_EMA_SLOW,
+  HTF_GAP_BPS,
+  ATR_PERIOD,
+  ATR_MAX_PCT,
+  RSI_PERIOD,
+  RSI_OVERBOUGHT,
+  RSI_OVERBOUGHT_BULL,
+  REQUIRE_DOUBLE_CLOSE,
   USE_NEWS_FILTER,
   NEWS_WINDOW_MIN,
   NEWS_BLOCK_IF_NEGATIVE_COUNT,
@@ -580,6 +608,72 @@ function ema(values: number[], period: number): number[] {
 }
 function last<T>(arr: T[], n = 1) {
   return arr.slice(-n);
+}
+
+// ===== Technical helpers: RSI and ATR =====
+function rsi(values: number[], period: number): number[] {
+  const n = values.length;
+  if (n < period + 1) return [];
+  const gains: number[] = [];
+  const losses: number[] = [];
+  for (let i = 1; i < n; i++) {
+    const diff = values[i] - values[i - 1];
+    gains.push(Math.max(0, diff));
+    losses.push(Math.max(0, -diff));
+  }
+  // initial averages (simple)
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 0; i < period; i++) {
+    avgGain += gains[i];
+    avgLoss += losses[i];
+  }
+  avgGain /= period;
+  avgLoss /= period;
+  const out: number[] = new Array(period).fill(NaN);
+  // Wilder's smoothing for subsequent
+  for (let i = period; i < gains.length; i++) {
+    avgGain = (avgGain * (period - 1) + gains[i]) / period;
+    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+    const rs = avgLoss === 0 ? Infinity : avgGain / avgLoss;
+    const r = 100 - 100 / (1 + rs);
+    out.push(r);
+  }
+  return out;
+}
+
+function atr(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  period: number
+): number[] {
+  const len = Math.min(highs.length, lows.length, closes.length);
+  if (len < period + 1) return [];
+  const trs: number[] = [];
+  for (let i = 1; i < len; i++) {
+    const high = highs[i];
+    const low = lows[i];
+    const prevClose = closes[i - 1];
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+    trs.push(tr);
+  }
+  // Wilder's smoothing
+  let atrPrev = 0;
+  for (let i = 0; i < period; i++) atrPrev += trs[i];
+  atrPrev /= period;
+  const out: number[] = new Array(period).fill(NaN);
+  out.push(atrPrev);
+  for (let i = period; i < trs.length; i++) {
+    const a = (atrPrev * (period - 1) + trs[i]) / period;
+    out.push(a);
+    atrPrev = a;
+  }
+  return out;
 }
 
 // ===================== SYNC (지갑↔포지션) =====================
@@ -1493,9 +1587,58 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               }
             } catch {}
             const regimeOk = !USE_REGIME_FILTER || fast >= slow;
+            // 상위TF 필터: 상위 추세 정합 + 가격이 상위 slow 위로 일정 갭 이상
+            let htfOk = true;
+            if (USE_HTF_FILTER) {
+              try {
+                const htfCandles = await fetchCandlesCached(
+                  symbol,
+                  HTF_TF as any,
+                  120
+                );
+                const htfCloses: number[] = htfCandles.map(
+                  (c: any) => Number(c[4]) || 0
+                );
+                const htfHighs: number[] = htfCandles.map(
+                  (c: any) => Number(c[2]) || 0
+                );
+                const htfLows: number[] = htfCandles.map(
+                  (c: any) => Number(c[3]) || 0
+                );
+                const eFast = ema(
+                  htfCloses,
+                  Math.min(HTF_EMA_FAST, htfCloses.length)
+                );
+                const eSlow = ema(
+                  htfCloses,
+                  Math.min(HTF_EMA_SLOW, htfCloses.length)
+                );
+                const f = last(eFast, 1)[0] ?? 0;
+                const s = last(eSlow, 1)[0] ?? 0;
+                const gap = s > 0 ? ((lastPx - s) / s) * 10000 : 0;
+                htfOk = f >= s && gap >= HTF_GAP_BPS;
+                // ATR 변동성 가드: 최근 ATR%가 레벨 초과면 신규 진입 보류
+                if (htfOk && ATR_MAX_PCT > 0) {
+                  const a = atr(htfHighs, htfLows, htfCloses, ATR_PERIOD);
+                  const aLast = last(a, 1)[0];
+                  if (Number.isFinite(aLast) && aLast && lastPx) {
+                    const atrPct = aLast / lastPx;
+                    if (atrPct > ATR_MAX_PCT) htfOk = false;
+                  }
+                }
+              } catch {}
+            }
             const tol = hh * (BREAKOUT_TOL_BPS / 10000);
             const breakoutLine = hh + tol;
             const breakoutOk = lastPx >= breakoutLine;
+            // 이중 종가 확인: 직전 2개 완성봉 모두 돌파선 위 마감
+            let doubleCloseOk = true;
+            if (REQUIRE_DOUBLE_CLOSE) {
+              const prev2 = last(candles, 3);
+              const c1 = prev2[0] ? Number(prev2[0][4]) : 0;
+              const c2 = prev2[1] ? Number(prev2[1][4]) : 0;
+              doubleCloseOk = c1 > breakoutLine && c2 > breakoutLine;
+            }
 
             // 이전 봉 종가가 돌파선 위로 마감해야 하는 옵션 (불장 완화 지원)
             let closeFilterOk = true;
@@ -1522,7 +1665,26 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               if (!extensionOk) incFail("over-extended");
             }
 
-            if (regimeOk && breakoutOk && closeFilterOk && extensionOk) {
+            // RSI 과매수 필터: 불장에선 완화 임계 사용
+            let rsiOk = true;
+            try {
+              const r = rsi(closes, RSI_PERIOD);
+              const rLast = last(r, 1)[0];
+              if (Number.isFinite(rLast)) {
+                const limit = bullBias ? RSI_OVERBOUGHT_BULL : RSI_OVERBOUGHT;
+                rsiOk = rLast <= limit;
+              }
+            } catch {}
+
+            if (
+              regimeOk &&
+              htfOk &&
+              breakoutOk &&
+              closeFilterOk &&
+              extensionOk &&
+              doubleCloseOk &&
+              rsiOk
+            ) {
               // 돌파선 상단 유지 시간 게이트 (불장에선 완화)
               const holdMsActive = bullBias
                 ? HOLD_ABOVE_BREAKOUT_MS_BULL
