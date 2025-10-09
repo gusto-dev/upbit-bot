@@ -29,6 +29,7 @@ export type SavedState = {
   lossesToday?: number;
   grossToday?: number;
   feeToday?: number;
+  dailyLossTrades?: number; // 당일 손실로 마감된 트레이드 수
 };
 
 export function loadState(): SavedState {
@@ -54,6 +55,7 @@ export function loadState(): SavedState {
     if (typeof raw.lossesToday !== "number") raw.lossesToday = 0;
     if (typeof raw.grossToday !== "number") raw.grossToday = 0;
     if (typeof raw.feeToday !== "number") raw.feeToday = 0;
+    if (typeof raw.dailyLossTrades !== "number") raw.dailyLossTrades = 0;
     return raw;
   } catch {
     return {
@@ -66,6 +68,7 @@ export function loadState(): SavedState {
       lossesToday: 0,
       grossToday: 0,
       feeToday: 0,
+      dailyLossTrades: 0,
     };
   }
 }

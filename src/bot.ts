@@ -139,6 +139,33 @@ const COOLDOWN_NOTICE_MIN = clamp(
   1440
 );
 
+// ===== 롱홀드 모드(손절 여유 확대 + 최대 보유기간 관리) =====
+const LONG_HOLD_MODE = bool(process.env.LONG_HOLD_MODE, false);
+const LONG_HOLD_MAX_DAYS = clamp(num(process.env.LONG_HOLD_MAX_DAYS, 7), 1, 30);
+// ATR 기반 추가 버퍼 배수: stop buffer = max(entry * (BPS/1e4), ATR * K)
+const LONG_HOLD_ATR_K = clamp(num(process.env.LONG_HOLD_ATR_K, 3), 0, 20);
+// 롱홀드 시 사용할 느슨한 트레일 임계(예: -6%)
+const LONG_HOLD_TRAIL = clamp(
+  num(process.env.LONG_HOLD_TRAIL, -0.06),
+  -0.5,
+  -0.001
+);
+// TP1 후 스톱 타이트닝 비활성화 (롱홀드 시 기본 true)
+const LONG_HOLD_DISABLE_TP_TIGHTEN = bool(
+  process.env.LONG_HOLD_DISABLE_TP_TIGHTEN,
+  true
+);
+// 최대 보유기간 초과 시 자동 청산 여부(기본 false), 알림은 항상 전송
+const LONG_HOLD_TIME_EXIT = bool(process.env.LONG_HOLD_TIME_EXIT, false);
+
+// 일일 손실 트레이드 수 초과 시 신규 진입 중단 (0이면 비활성화)
+const HALT_AFTER_N_LOSSES = clamp(
+  num(process.env.HALT_AFTER_N_LOSSES, 0),
+  0,
+  100
+);
+const HALT_NOTIFY_ONCE = bool(process.env.HALT_NOTIFY_ONCE, true);
+
 // ===== 추가 사이징/리스크 옵션 =====
 // 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
 const FIXED_ENTRY_KRW = clamp(
@@ -368,6 +395,14 @@ console.log("CONFIG", {
   STOP_AFTER_STOP_COOLDOWN_MIN,
   MIN_GAP_BETWEEN_ENTRIES_MIN,
   COOLDOWN_NOTICE_MIN,
+  LONG_HOLD_MODE,
+  LONG_HOLD_MAX_DAYS,
+  LONG_HOLD_ATR_K,
+  LONG_HOLD_TRAIL,
+  LONG_HOLD_DISABLE_TP_TIGHTEN,
+  LONG_HOLD_TIME_EXIT,
+  HALT_AFTER_N_LOSSES,
+  HALT_NOTIFY_ONCE,
 });
 
 // ===================== TYPES/STATE =====================
@@ -413,6 +448,16 @@ function canEnterByLossLimit(): boolean {
   const ddPct = realizedToday / baseEq; // realizedToday가 손실이면 음수
   return ddPct > MAX_DAILY_DRAWDOWN_PCT; // 더 낮게 내려가면 false
 }
+
+// 일일 손실 트레이드 수 기준 추가 게이트
+let dailyLossTrades = 0; // 당일 손실로 마감된 트레이드 수
+let _haltNoticeSentForDay = ""; // KST 날짜 문자열로 중복 알림 방지
+function canEnterByDailyLossTrades(): boolean {
+  if (HALT_AFTER_N_LOSSES <= 0) return true;
+  return dailyLossTrades < HALT_AFTER_N_LOSSES;
+}
+// 일일 손실금액 한도 초과 알림(하루 1회)
+let _ddNoticeSentForDay = "";
 
 // ===================== EXCHANGE =====================
 const exchange = new ccxt.upbit({
@@ -1309,7 +1354,22 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
           // 동적 / 기본 손절 갱신
           if (USE_DYNAMIC_STOP) {
-            const buffer = pos.entry * (activeDynStopBps / 10000);
+            let buffer = pos.entry * (activeDynStopBps / 10000);
+            // 롱홀드 모드면 ATR 기반 추가 버퍼 적용(가능할 때)
+            if (LONG_HOLD_MODE && LONG_HOLD_ATR_K > 0) {
+              try {
+                const a = atr(
+                  candles.map((c) => Number(c[2]) || 0),
+                  candles.map((c) => Number(c[3]) || 0),
+                  candles.map((c) => Number(c[4]) || 0),
+                  ATR_PERIOD
+                );
+                const aLast = last(a, 1)[0];
+                if (Number.isFinite(aLast) && aLast > 0) {
+                  buffer = Math.max(buffer, aLast * LONG_HOLD_ATR_K);
+                }
+              } catch {}
+            }
             const candidate = pos.peak - buffer;
             if (!pos.stopPrice || candidate > pos.stopPrice) {
               // stop은 entry보다 아래로 (롱 기준) 너무 올라가지 않도록 (진입 직후 peak=entry 상황 보호)
@@ -1318,7 +1378,10 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               // 돌파 조건이 깨지면 타임스탬프 초기화
               _holdAboveBreakoutSince.delete(symbol);
             }
-            if (pos.tookTP1 && DYN_STOP_TIGHTEN_AFTER_TP1 && pos.stopPrice) {
+            const tightenAllowed = LONG_HOLD_MODE
+              ? !LONG_HOLD_DISABLE_TP_TIGHTEN
+              : DYN_STOP_TIGHTEN_AFTER_TP1;
+            if (pos.tookTP1 && tightenAllowed && pos.stopPrice) {
               const tighten = pos.entry * 0.002; // 0.2% tighten
               pos.stopPrice = Math.max(pos.stopPrice, pos.entry + tighten);
             }
@@ -1345,12 +1408,29 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 realizedToday += net;
                 grossToday += gross;
                 feeToday += fee;
+                // 누적 포지션 손익 집계
+                pos.runningNet = (pos.runningNet || 0) + net;
+                pos.runningGross = (pos.runningGross || 0) + gross;
+                pos.runningFee = (pos.runningFee || 0) + fee;
                 const remaining = pos.size - adaptive.sold;
                 const pct = ((lastPx - refEntry) / refEntry) * 100;
                 if (remaining <= pos.size * 0.05 || remaining <= 0) {
                   positions.delete(symbol);
                   fullyExited = true;
                   _lastStopAt.set(symbol, Date.now());
+                  // 손절로 전량 종료: 손실 트레이드로 계산
+                  dailyLossTrades += 1;
+                  const today = todayStrKST();
+                  if (
+                    HALT_AFTER_N_LOSSES > 0 &&
+                    dailyLossTrades >= HALT_AFTER_N_LOSSES &&
+                    (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today)
+                  ) {
+                    await tg(
+                      `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → 금일 신규 진입 중단`
+                    );
+                    _haltNoticeSentForDay = today;
+                  }
                   await tg(
                     `❌ 손절: ${symbol} @${Math.round(lastPx)} (${pct.toFixed(
                       2
@@ -1416,6 +1496,9 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               realizedToday += net;
               grossToday += gross;
               feeToday += fee;
+              pos.runningNet = (pos.runningNet || 0) + net;
+              pos.runningGross = (pos.runningGross || 0) + gross;
+              pos.runningFee = (pos.runningFee || 0) + fee;
               if (net >= 0) winsToday++;
               else lossesToday++;
               await tg(
@@ -1446,11 +1529,28 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               realizedToday += net;
               grossToday += gross;
               feeToday += fee;
+              pos.runningNet = (pos.runningNet || 0) + net;
+              pos.runningGross = (pos.runningGross || 0) + gross;
+              pos.runningFee = (pos.runningFee || 0) + fee;
               const remaining = pos.size - adaptive.sold;
               if (remaining <= pos.size * 0.05 || remaining <= 0) {
                 positions.delete(symbol);
-                if (net >= 0) winsToday++;
-                else lossesToday++;
+                if ((pos.runningNet || 0) >= 0) winsToday++;
+                else {
+                  lossesToday++;
+                  dailyLossTrades += 1;
+                  const today = todayStrKST();
+                  if (
+                    HALT_AFTER_N_LOSSES > 0 &&
+                    dailyLossTrades >= HALT_AFTER_N_LOSSES &&
+                    (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today)
+                  ) {
+                    await tg(
+                      `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → 금일 신규 진입 중단`
+                    );
+                    _haltNoticeSentForDay = today;
+                  }
+                }
                 await tg(
                   `🎯 TP2: ${symbol} 전량/거의 전량 익절 sold=${adaptive.sold.toFixed(
                     6
@@ -1475,53 +1575,146 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             } else {
               await tg(`❗ TP2 실패: ${symbol} | ${r.reason}`);
             }
-          } else if ((lastPx - pos.peak) / pos.peak <= activeTrail) {
-            const adaptive = await tryAdaptiveSell(symbol, pos.size, lastPx);
-            const r = adaptive.result;
-            if (r.ok && adaptive.sold > 0) {
-              const refEntry = pos.originalEntry ?? pos.entry;
-              const { gross, fee, net } = pnlBreakdown(
-                refEntry,
-                lastPx,
-                adaptive.sold
-              );
-              realizedToday += net;
-              grossToday += gross;
-              feeToday += fee;
-              const remaining = pos.size - adaptive.sold;
-              if (remaining <= pos.size * 0.05 || remaining <= 0) {
-                positions.delete(symbol);
-                if (net >= 0) winsToday++;
-                else lossesToday++;
-                await tg(
-                  `🛑 트레일 스탑: ${symbol} 청산 sold=${adaptive.sold.toFixed(
-                    6
-                  )}\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
-                    0
-                  )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
+          } else {
+            const trailRef = LONG_HOLD_MODE
+              ? Math.min(activeTrail, LONG_HOLD_TRAIL)
+              : activeTrail;
+            if ((lastPx - pos.peak) / pos.peak <= trailRef) {
+              const adaptive = await tryAdaptiveSell(symbol, pos.size, lastPx);
+              const r = adaptive.result;
+              if (r.ok && adaptive.sold > 0) {
+                const refEntry = pos.originalEntry ?? pos.entry;
+                const { gross, fee, net } = pnlBreakdown(
+                  refEntry,
+                  lastPx,
+                  adaptive.sold
                 );
+                realizedToday += net;
+                grossToday += gross;
+                feeToday += fee;
+                pos.runningNet = (pos.runningNet || 0) + net;
+                pos.runningGross = (pos.runningGross || 0) + gross;
+                pos.runningFee = (pos.runningFee || 0) + fee;
+                const remaining = pos.size - adaptive.sold;
+                if (remaining <= pos.size * 0.05 || remaining <= 0) {
+                  positions.delete(symbol);
+                  if ((pos.runningNet || 0) >= 0) winsToday++;
+                  else {
+                    lossesToday++;
+                    dailyLossTrades += 1;
+                    const today = todayStrKST();
+                    if (
+                      HALT_AFTER_N_LOSSES > 0 &&
+                      dailyLossTrades >= HALT_AFTER_N_LOSSES &&
+                      (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today)
+                    ) {
+                      await tg(
+                        `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → 금일 신규 진입 중단`
+                      );
+                      _haltNoticeSentForDay = today;
+                    }
+                  }
+                  await tg(
+                    `🛑 트레일 스탑: ${symbol} 청산 sold=${adaptive.sold.toFixed(
+                      6
+                    )}\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
+                      0
+                    )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
+                  );
+                } else {
+                  pos.size = remaining;
+                  pos.invested = pos.size * lastPx;
+                  positions.set(symbol, pos);
+                  await tg(
+                    `🛑 트레일 부분: ${symbol} 남은=${remaining.toFixed(
+                      6
+                    )} sold=${adaptive.sold.toFixed(6)}\n gross=${gross.toFixed(
+                      0
+                    )} fee=${fee.toFixed(0)} net=${net.toFixed(
+                      0
+                    )} cum=${Math.round(realizedToday)}`
+                  );
+                }
               } else {
-                pos.size = remaining;
-                pos.invested = pos.size * lastPx;
-                positions.set(symbol, pos);
-                await tg(
-                  `🛑 트레일 부분: ${symbol} 남은=${remaining.toFixed(
-                    6
-                  )} sold=${adaptive.sold.toFixed(6)}\n gross=${gross.toFixed(
-                    0
-                  )} fee=${fee.toFixed(0)} net=${net.toFixed(
-                    0
-                  )} cum=${Math.round(realizedToday)}`
-                );
+                await tg(`❗ 트레일 실패: ${symbol} | ${r.reason}`);
               }
-            } else {
-              await tg(`❗ 트레일 실패: ${symbol} | ${r.reason}`);
+            }
+          }
+
+          // 롱홀드: 최대 보유기간 관리 (KST 기준)
+          if (LONG_HOLD_MODE && LONG_HOLD_MAX_DAYS > 0) {
+            const heldMs = Date.now() - (pos.openedAt || Date.now());
+            const maxMs = LONG_HOLD_MAX_DAYS * 24 * 60 * 60 * 1000;
+            if (heldMs >= maxMs) {
+              await tg(
+                `⏳ 보유기간 만료(${LONG_HOLD_MAX_DAYS}d): ${symbol} | pnl=${(
+                  pnlPct * 100
+                ).toFixed(2)}%`
+              );
+              if (LONG_HOLD_TIME_EXIT) {
+                const adaptive = await tryAdaptiveSell(
+                  symbol,
+                  pos.size,
+                  lastPx
+                );
+                const r = adaptive.result;
+                if (r.ok && adaptive.sold > 0) {
+                  const refEntry = pos.originalEntry ?? pos.entry;
+                  const { gross, fee, net } = pnlBreakdown(
+                    refEntry,
+                    lastPx,
+                    adaptive.sold
+                  );
+                  realizedToday += net;
+                  grossToday += gross;
+                  feeToday += fee;
+                  pos.runningNet = (pos.runningNet || 0) + net;
+                  pos.runningGross = (pos.runningGross || 0) + gross;
+                  pos.runningFee = (pos.runningFee || 0) + fee;
+                  positions.delete(symbol);
+                  if ((pos.runningNet || 0) >= 0) winsToday++;
+                  else {
+                    lossesToday++;
+                    dailyLossTrades += 1;
+                  }
+                  await tg(
+                    `📆 롱홀드 만료 청산: ${symbol} sold=${adaptive.sold.toFixed(
+                      6
+                    )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
+                  );
+                  await sleep(1000);
+                  continue;
+                } else {
+                  await tg(`❗ 롱홀드 만료 청산 실패: ${symbol} | ${r.reason}`);
+                }
+              }
             }
           }
         }
 
         // ====== 신규 진입 ======
-        if (!inPos && !quiet && canEnterByLossLimit()) {
+        if (!inPos && !quiet) {
+          // 손실 한도/일일 손실 트레이드 수 제한 체크
+          if (!canEnterByLossLimit()) {
+            const today = todayStrKST();
+            if (_ddNoticeSentForDay !== today) {
+              await tg("⛔ 일일 손실금액 한도 도달: 금일 신규 진입 중단");
+              _ddNoticeSentForDay = today;
+            }
+            await sleep(500);
+            continue;
+          }
+          if (!canEnterByDailyLossTrades()) {
+            const today = todayStrKST();
+            if (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today) {
+              await tg(
+                `⛔ 일일 손실 트레이드 ${HALT_AFTER_N_LOSSES}회 도달: 신규 진입 중단 (금일)`
+              );
+              _haltNoticeSentForDay = today;
+            }
+            await sleep(500);
+            continue;
+          }
           // 뉴스 필터: 시장 부정 헤드라인 다수일 때 신규 진입 보류 (불장 시 자동 비활성 옵션 지원)
           const newsFilterActiveNow =
             USE_NEWS_FILTER && !(bullBias && NEWS_FILTER_DISABLE_IN_BULL);
@@ -1836,6 +2029,8 @@ async function main() {
       grossToday = Number((prev as any).grossToday) || 0;
     if (typeof (prev as any).feeToday === "number")
       feeToday = Number((prev as any).feeToday) || 0;
+    if (typeof (prev as any).dailyLossTrades === "number")
+      dailyLossTrades = Number((prev as any).dailyLossTrades) || 0;
   } catch {}
 
   const feed = new UpbitTickerFeed(codes);
@@ -1917,6 +2112,7 @@ async function main() {
         lossesToday,
         grossToday,
         feeToday,
+        dailyLossTrades,
       });
       console.log("[AUTOSAVE] persisted", { realizedToday });
     } catch (e) {
@@ -1965,6 +2161,7 @@ async function main() {
           lossesToday,
           grossToday,
           feeToday,
+          dailyLossTrades,
         });
       } catch {}
       // reset counters for new day
@@ -1974,6 +2171,9 @@ async function main() {
       grossToday = 0;
       feeToday = 0;
       realizedToday = 0;
+      dailyLossTrades = 0;
+      _haltNoticeSentForDay = "";
+      _ddNoticeSentForDay = "";
     }
   }, 60_000);
 
@@ -2012,6 +2212,7 @@ async function main() {
         lossesToday,
         grossToday,
         feeToday,
+        dailyLossTrades,
       });
     } catch {}
     process.exit(0);
@@ -2050,6 +2251,7 @@ async function main() {
         lossesToday,
         grossToday,
         feeToday,
+        dailyLossTrades,
       });
     } catch {}
     process.exit(0);
