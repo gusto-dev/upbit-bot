@@ -4,7 +4,7 @@ import "dotenv/config";
 import ccxt from "ccxt";
 import { UpbitTickerFeed } from "./lib/wsTicker";
 import { loadState, saveState } from "./lib/persist";
-import { SimpleNewsSentiment } from "./lib/news";
+// 뉴스 필터 제거됨
 
 // ===================== ENV (Validated) =====================
 function num(v: any, d: number) {
@@ -138,6 +138,7 @@ const COOLDOWN_NOTICE_MIN = clamp(
   1,
   1440
 );
+const DISABLE_BUY = bool(process.env.DISABLE_BUY, false);
 
 // ===== 롱홀드 모드(손절 여유 확대 + 최대 보유기간 관리) =====
 const LONG_HOLD_MODE = bool(process.env.LONG_HOLD_MODE, false);
@@ -281,33 +282,6 @@ const MAX_BREAKOUT_EXTENSION_BPS = clamp(
   5000
 );
 
-// ===== 뉴스/심리 필터 (선택) =====
-const USE_NEWS_FILTER = bool(process.env.USE_NEWS_FILTER, false);
-const NEWS_FEEDS = (process.env.NEWS_FEEDS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const NEWS_NEGATIVE_KWS = (
-  process.env.NEWS_NEGATIVE_KWS ||
-  "급락,하락,규제,해킹,보이스피싱,점검,중단,상장폐지,의혹"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const NEWS_WINDOW_MIN = clamp(num(process.env.NEWS_WINDOW_MIN, 60), 5, 720);
-const NEWS_BLOCK_IF_NEGATIVE_COUNT = clamp(
-  num(process.env.NEWS_BLOCK_IF_NEGATIVE_COUNT, 3),
-  1,
-  50
-);
-const NEWS_REFRESH_MIN = clamp(num(process.env.NEWS_REFRESH_MIN, 5), 1, 120);
-// 중복 선언 방지: 위에서 정의된 경우 재선언하지 않음
-// NEWS_FILTER_LOG_ONLY는 이전에 선언되어 있음
-const NEWS_FILTER_DISABLE_IN_BULL = bool(
-  process.env.NEWS_FILTER_DISABLE_IN_BULL,
-  true
-);
-const NEWS_FILTER_LOG_ONLY = bool(process.env.NEWS_FILTER_LOG_ONLY, false);
 // 불장 시 더 큰 확장을 허용(완화)
 const MAX_BREAKOUT_EXTENSION_BPS_BULL = clamp(
   num(process.env.MAX_BREAKOUT_EXTENSION_BPS_BULL, 80),
@@ -386,12 +360,6 @@ console.log("CONFIG", {
   RSI_OVERBOUGHT,
   RSI_OVERBOUGHT_BULL,
   REQUIRE_DOUBLE_CLOSE,
-  USE_NEWS_FILTER,
-  NEWS_WINDOW_MIN,
-  NEWS_BLOCK_IF_NEGATIVE_COUNT,
-  NEWS_REFRESH_MIN,
-  NEWS_FILTER_LOG_ONLY,
-  NEWS_FILTER_DISABLE_IN_BULL,
   STOP_AFTER_STOP_COOLDOWN_MIN,
   MIN_GAP_BETWEEN_ENTRIES_MIN,
   COOLDOWN_NOTICE_MIN,
@@ -724,10 +692,6 @@ function atr(
 // ===================== SYNC (지갑↔포지션) =====================
 const _noWalletStrike: Map<string, number> = new Map();
 let _syncLock = false;
-// 뉴스 필터 전역 상태
-let globalNewsRestrict = false;
-let newsLastReason = "";
-let _newsFilter: SimpleNewsSentiment | null = null;
 // 심볼별 불장 상태와 전역 집계 불장 상태(알림 전환용)
 const _symbolBullBias: Map<string, boolean> = new Map();
 let _prevAggregateBull: boolean | null = null;
@@ -1303,21 +1267,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           const now = Date.now();
           if (now - _lastBullEventTs > 2000) {
             // 2초 디바운스
-            if (anyBull) {
-              if (NEWS_FILTER_DISABLE_IN_BULL && USE_NEWS_FILTER) {
-                await tg(
-                  "🟢 불장 진입: 뉴스 필터 자동 비활성 (신규 진입 제한 해제)"
-                );
-              } else {
-                await tg("🟢 불장 진입");
-              }
-            } else {
-              if (NEWS_FILTER_DISABLE_IN_BULL && USE_NEWS_FILTER) {
-                await tg("⚪ 불장 종료: 뉴스 필터 재활성");
-              } else {
-                await tg("⚪ 불장 종료");
-              }
-            }
+            await tg(anyBull ? "🟢 불장 진입" : "⚪ 불장 종료");
             _lastBullEventTs = now;
           }
           _prevAggregateBull = anyBull;
@@ -1715,25 +1665,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             await sleep(500);
             continue;
           }
-          // 뉴스 필터: 시장 부정 헤드라인 다수일 때 신규 진입 보류 (불장 시 자동 비활성 옵션 지원)
-          const newsFilterActiveNow =
-            USE_NEWS_FILTER && !(bullBias && NEWS_FILTER_DISABLE_IN_BULL);
-          if (newsFilterActiveNow && globalNewsRestrict) {
-            if (NEWS_FILTER_LOG_ONLY) {
-              await tg(
-                `📰 [로그전용] 뉴스 필터 적중(진입 허용): ${symbol} | ${
-                  newsLastReason || "-"
-                }`
-              );
-            } else {
-              incFail("news-restrict");
-              await tg(
-                `📰 뉴스 필터로 진입 보류: ${symbol} | ${newsLastReason || "-"}`
-              );
-              await sleep(1000);
-              continue;
-            }
-          }
+          // 뉴스 필터 제거됨
           if (Array.from(positions.keys()).length >= MAX_CONCURRENT_POS) {
             // 동시 포지션 제한 → 스킵
           } else if (getTradeCount(symbol) >= MAX_TRADES_PER_DAY) {
@@ -2036,26 +1968,7 @@ async function main() {
   const feed = new UpbitTickerFeed(codes);
   feed.connect();
 
-  // 뉴스 필터 초기화 및 주기 새로고침
-  if (USE_NEWS_FILTER && NEWS_FEEDS.length) {
-    _newsFilter = new SimpleNewsSentiment(NEWS_FEEDS, {
-      timeWindowMs: NEWS_WINDOW_MIN * 60_000,
-      negativeKeywords: NEWS_NEGATIVE_KWS,
-      blockIfNegativeCount: NEWS_BLOCK_IF_NEGATIVE_COUNT,
-    });
-    const refresh = async () => {
-      try {
-        await _newsFilter!.refreshNow();
-        globalNewsRestrict = _newsFilter!.shouldRestrict();
-        newsLastReason = _newsFilter!.getLastReason();
-      } catch {
-        // ignore
-      }
-    };
-    // 즉시 1회 + 주기 실행
-    await refresh();
-    setInterval(refresh, Math.max(1, NEWS_REFRESH_MIN) * 60_000);
-  }
+  // 뉴스 필터 제거됨
 
   console.log(
     `BOT START | MODE=${MODE} | symbols=${symbols.join(", ")} | TF=${TF}`
