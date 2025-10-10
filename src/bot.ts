@@ -56,6 +56,7 @@ let TP1 = clamp(num(process.env.TP1, 0.012), 0.001, 0.2);
 let TP2 = clamp(num(process.env.TP2, 0.022), TP1 + 0.001, 0.5);
 let TRAIL = clamp(num(process.env.TRAIL, -0.015), -0.2, -0.001);
 const USE_BEP_AFTER_TP1 = bool(process.env.USE_BEP_AFTER_TP1, true);
+const USE_FEE_SAFE_BEP = bool(process.env.USE_FEE_SAFE_BEP, true);
 let FEE_BPS = clamp(num(process.env.FEE_BPS, 5), 0, 100); // 0.05% 기본 (5 bps)
 let MAX_TRADES_PER_DAY = clamp(num(process.env.MAX_TRADES_PER_DAY, 4), 1, 50);
 let MAX_CONCURRENT_POS = clamp(
@@ -166,6 +167,17 @@ const HALT_AFTER_N_LOSSES = clamp(
   100
 );
 const HALT_NOTIFY_ONCE = bool(process.env.HALT_NOTIFY_ONCE, true);
+
+// 일일 순이익 목표 도달 시 신규 진입 중단 (0이면 비활성화)
+const DAILY_NET_PROFIT_CAP_PCT = clamp(
+  num(process.env.DAILY_NET_PROFIT_CAP_PCT, 0),
+  0,
+  1
+);
+const DAILY_PROFIT_NOTIFY_ONCE = bool(
+  process.env.DAILY_PROFIT_NOTIFY_ONCE,
+  true
+);
 
 // ===== 추가 사이징/리스크 옵션 =====
 // 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
@@ -371,6 +383,9 @@ console.log("CONFIG", {
   LONG_HOLD_TIME_EXIT,
   HALT_AFTER_N_LOSSES,
   HALT_NOTIFY_ONCE,
+  USE_FEE_SAFE_BEP,
+  DAILY_NET_PROFIT_CAP_PCT,
+  DAILY_PROFIT_NOTIFY_ONCE,
 });
 
 // ===================== TYPES/STATE =====================
@@ -426,6 +441,7 @@ function canEnterByDailyLossTrades(): boolean {
 }
 // 일일 손실금액 한도 초과 알림(하루 1회)
 let _ddNoticeSentForDay = "";
+let _profitCapNoticeSentForDay = "";
 
 // ===================== EXCHANGE =====================
 const exchange = new ccxt.upbit({
@@ -1332,8 +1348,20 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               ? !LONG_HOLD_DISABLE_TP_TIGHTEN
               : DYN_STOP_TIGHTEN_AFTER_TP1;
             if (pos.tookTP1 && tightenAllowed && pos.stopPrice) {
-              const tighten = pos.entry * 0.002; // 0.2% tighten
-              pos.stopPrice = Math.max(pos.stopPrice, pos.entry + tighten);
+              // 수수료까지 고려한 BEP 스톱 보정 (옵션)
+              if (USE_FEE_SAFE_BEP) {
+                // 남은 수량을 pos.size로, 진입/청산 시 수수료를 모두 고려하여 순손익>=0이 되도록 하는 최소 가격을 추정
+                // 순손익(net) = (Px - entry) * qty - (entry + Px) * qty * feeRate
+                //           = qty * [ Px*(1 - feeRate) - entry*(1 + feeRate) ]
+                // net >= 0 → Px >= entry * (1 + feeRate) / (1 - feeRate)
+                const fee = FEE_RATE;
+                const bePx =
+                  fee < 1 ? pos.entry * ((1 + fee) / (1 - fee)) : pos.entry; // 안전장치
+                pos.stopPrice = Math.max(pos.stopPrice, bePx);
+              } else {
+                const tighten = pos.entry * 0.002; // 0.2% tighten
+                pos.stopPrice = Math.max(pos.stopPrice, pos.entry + tighten);
+              }
             }
           } else {
             // static stop (최초 지정 없으면 entry 기반)
@@ -1433,8 +1461,15 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               pos.invested = pos.size * lastPx;
               pos.tookTP1 = true;
               if (USE_BEP_AFTER_TP1) pos.entry = Math.min(pos.entry, lastPx);
-              if (pos.stopPrice && pos.stopPrice < pos.entry) {
-                pos.stopPrice = pos.entry * 0.999; // 수수료 고려 살짝 아래
+              if (pos.stopPrice) {
+                if (USE_FEE_SAFE_BEP) {
+                  const fee = FEE_RATE;
+                  const bePx =
+                    fee < 1 ? pos.entry * ((1 + fee) / (1 - fee)) : pos.entry;
+                  pos.stopPrice = Math.max(pos.stopPrice, bePx);
+                } else if (pos.stopPrice < pos.entry) {
+                  pos.stopPrice = pos.entry * 0.999; // 수수료 고려 살짝 아래
+                }
               }
               positions.set(symbol, pos);
               const refEntry = pos.originalEntry ?? pos.entry;
@@ -1653,6 +1688,29 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             }
             await sleep(500);
             continue;
+          }
+          // 일일 순이익 목표 도달 시 신규 진입 중단
+          if (DAILY_NET_PROFIT_CAP_PCT > 0) {
+            const baseEq = BASE_CAPITAL_KRW;
+            if (
+              baseEq > 0 &&
+              realizedToday / baseEq >= DAILY_NET_PROFIT_CAP_PCT
+            ) {
+              const today = todayStrKST();
+              if (
+                !DAILY_PROFIT_NOTIFY_ONCE ||
+                _profitCapNoticeSentForDay !== today
+              ) {
+                await tg(
+                  `✅ 일일 순이익 목표 도달 (${(
+                    DAILY_NET_PROFIT_CAP_PCT * 100
+                  ).toFixed(2)}%) → 금일 신규 진입 중단`
+                );
+                _profitCapNoticeSentForDay = today;
+              }
+              await sleep(500);
+              continue;
+            }
           }
           if (!canEnterByDailyLossTrades()) {
             const today = todayStrKST();
@@ -2087,6 +2145,7 @@ async function main() {
       dailyLossTrades = 0;
       _haltNoticeSentForDay = "";
       _ddNoticeSentForDay = "";
+      _profitCapNoticeSentForDay = "";
     }
   }, 60_000);
 
