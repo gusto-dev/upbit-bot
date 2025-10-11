@@ -140,6 +140,12 @@ const COOLDOWN_NOTICE_MIN = clamp(
   1440
 );
 const DISABLE_BUY = bool(process.env.DISABLE_BUY, false);
+const DEBUG_ENTRY_GATES = bool(process.env.DEBUG_ENTRY_GATES, false);
+const DEBUG_ENTRY_LOG_FREQ_SEC = clamp(
+  num(process.env.DEBUG_ENTRY_LOG_FREQ_SEC, 60),
+  5,
+  3600
+);
 
 // ===== 롱홀드 모드(손절 여유 확대 + 최대 보유기간 관리) =====
 const LONG_HOLD_MODE = bool(process.env.LONG_HOLD_MODE, false);
@@ -718,6 +724,18 @@ const _lastEntryAt: Map<string, number> = new Map();
 // 쿨다운 알림 타임스탬프 추적 (스팸 방지)
 const _lastStopCooldownNoticeAt: Map<string, number> = new Map();
 const _lastEntryGapNoticeAt: Map<string, number> = new Map();
+// 신규 진입 디버그 로그 스로틀
+const _lastEntryDebugAt: Map<string, number> = new Map();
+
+function maybeDebugEntry(symbol: string, msg: string) {
+  if (!DEBUG_ENTRY_GATES) return;
+  const now = Date.now();
+  const last = _lastEntryDebugAt.get(symbol) || 0;
+  if (now - last >= DEBUG_ENTRY_LOG_FREQ_SEC * 1000) {
+    _lastEntryDebugAt.set(symbol, now);
+    tg(`🧭 Entry skip ${symbol}: ${msg}`);
+  }
+}
 
 function canEnterByStopCooldown(symbol: string) {
   if (STOP_AFTER_STOP_COOLDOWN_MIN <= 0) return true;
@@ -1686,6 +1704,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               await tg("⛔ 일일 손실금액 한도 도달: 금일 신규 진입 중단");
               _ddNoticeSentForDay = today;
             }
+            maybeDebugEntry(symbol, "daily drawdown gate");
             await sleep(500);
             continue;
           }
@@ -1720,22 +1739,27 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               );
               _haltNoticeSentForDay = today;
             }
+            maybeDebugEntry(symbol, "daily loss-trades halt");
             await sleep(500);
             continue;
           }
           // 뉴스 필터 제거됨
           if (Array.from(positions.keys()).length >= MAX_CONCURRENT_POS) {
             // 동시 포지션 제한 → 스킵
+            maybeDebugEntry(symbol, "max concurrent positions");
           } else if (getTradeCount(symbol) >= MAX_TRADES_PER_DAY) {
             // 일일 진입 제한 → 스킵
+            maybeDebugEntry(symbol, "max trades per day");
           } else if (inBuyCooldown(symbol)) {
             // 매수 실패 쿨다운 중 → 스킵
+            maybeDebugEntry(symbol, "buy fail cooldown");
           } else if (!canEnterByStopCooldown(symbol)) {
             if (shouldNotifyCooldown(_lastStopCooldownNoticeAt, symbol)) {
               await tg(
                 `⏳ 손절 후 쿨다운: ${symbol} ${STOP_AFTER_STOP_COOLDOWN_MIN}분 대기`
               );
             }
+            maybeDebugEntry(symbol, "stop-after-stop cooldown");
             await sleep(300);
             continue;
           } else if (!canEnterByMinGap(symbol)) {
@@ -1744,6 +1768,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 `⏳ 연속 진입 간격 유지: ${symbol} ${MIN_GAP_BETWEEN_ENTRIES_MIN}분 대기`
               );
             }
+            maybeDebugEntry(symbol, "min gap between entries");
             await sleep(300);
             continue;
           } else {
@@ -1765,6 +1790,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                     0
                   )}`
                 );
+                maybeDebugEntry(symbol, "exposure cap");
                 await sleep(1500);
                 continue;
               }
@@ -1858,6 +1884,29 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 rsiOk = rLast <= limit;
               }
             } catch {}
+
+            // 디버그: 어떤 게이트에서 막혔는지 주기적으로 보고
+            if (
+              !(
+                regimeOk &&
+                htfOk &&
+                breakoutOk &&
+                closeFilterOk &&
+                extensionOk &&
+                doubleCloseOk &&
+                rsiOk
+              )
+            ) {
+              const reasons: string[] = [];
+              if (!regimeOk) reasons.push("regime");
+              if (!htfOk) reasons.push("htf");
+              if (!breakoutOk) reasons.push("breakout");
+              if (!closeFilterOk) reasons.push("prev-close");
+              if (!extensionOk) reasons.push("extension");
+              if (!doubleCloseOk) reasons.push("double-close");
+              if (!rsiOk) reasons.push("rsi");
+              maybeDebugEntry(symbol, reasons.join(","));
+            }
 
             if (
               regimeOk &&
