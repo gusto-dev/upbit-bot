@@ -272,6 +272,12 @@ const QUIET_HOUR_BULL_OVERRIDE = bool(
   process.env.QUIET_HOUR_BULL_OVERRIDE,
   true
 );
+// Bull/Flat 전환 알림 최소 간격(초) - 알림 스팸 방지용
+const BULL_EVENT_MIN_INTERVAL_SEC = clamp(
+  num(process.env.BULL_EVENT_MIN_INTERVAL_SEC, 60),
+  0,
+  3600
+);
 
 // ===== 정교한 진입 게이트(손절 빈도 감소 목적) =====
 // 이전 완성봉 종가가 돌파선(hh+tol) 위에서 마감되어야 진입 허용
@@ -1299,8 +1305,11 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
           _prevAggregateBull = anyBull;
         } else if (_prevAggregateBull !== anyBull) {
           const now = Date.now();
-          if (now - _lastBullEventTs > 2000) {
-            // 2초 디바운스
+          if (
+            now - _lastBullEventTs >
+            Math.max(2000, BULL_EVENT_MIN_INTERVAL_SEC * 1000)
+          ) {
+            // 최소 간격 적용 (기본 60초), 하한 2초
             await tg(anyBull ? "🟢 불장 진입" : "⚪ 불장 종료");
             _lastBullEventTs = now;
           }
