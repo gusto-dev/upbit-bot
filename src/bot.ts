@@ -581,6 +581,12 @@ function getMarketInfo(symbol: string): { precision?: { amount?: number } } {
   return (m || {}) as { precision?: { amount?: number } };
 }
 
+function getMinOrderCost(symbol: string): number {
+  const mi: any = getMarketInfo(symbol) || {};
+  const minCost = Number(mi?.limits?.cost?.min) || LIVE_MIN_ORDER_KRW;
+  return Math.max(minCost || 0, LIVE_MIN_ORDER_KRW || 0);
+}
+
 function normalizeSellAmount(symbol: string, amt: number): number {
   if (!Number.isFinite(amt) || amt <= 0) return 0;
   const mi: any = getMarketInfo(symbol);
@@ -907,6 +913,8 @@ const _stopFailCooldown: Map<string, number> = new Map(); // symbol -> next allo
 const _buyFailCooldown: Map<string, number> = new Map();
 // 돌파선 상단 유지 시간 체크를 위한 심볼별 타임스탬프
 const _holdAboveBreakoutSince: Map<string, number> = new Map();
+// TP1가 최소 주문금액 미만이라 스킵한 경우 중복 알림 방지
+const _tp1SkipNotified = new Set<string>();
 
 function inStopCooldown(symbol: string) {
   const t = _stopFailCooldown.get(symbol) || 0;
@@ -947,7 +955,6 @@ async function preflight(symbols: string[]) {
     if (willUpscale) msg += ` → upscale to ${minCost}`;
     msg += ` | minAmount=${minAmount || 0} prec=${precisionDigits ?? "n/a"}`;
     await tg(msg);
-    if (willUpscale) _upscaleNotified.add(sym);
   }
 }
 
@@ -1478,13 +1485,40 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
 
           // TP1 (절반 익절)
           if (!pos.tookTP1 && pnlPct >= TP1) {
-            const sellAmt = normalizeSellAmount(
+            let sellAmt = normalizeSellAmount(
               symbol,
               pos.size * tp1SellFracActive
             );
-            const r = await marketSell(symbol, sellAmt);
-            if (r.ok) {
-              pos.size -= sellAmt;
+            // Upbit 최소 주문금액(시장가 매도) 충족 보정
+            const minCost = getMinOrderCost(symbol);
+            const estQuote = sellAmt * lastPx;
+            if (minCost > 0 && estQuote < minCost) {
+              const totalQuote = pos.size * lastPx;
+              if (totalQuote >= minCost) {
+                const targetAmt = Math.min(
+                  pos.size,
+                  (minCost + MIN_TOTAL_SAFETY_KRW) / lastPx
+                );
+                sellAmt = normalizeSellAmount(symbol, targetAmt);
+              } else {
+                if (!_tp1SkipNotified.has(symbol)) {
+                  await tg(
+                    `ℹ️ TP1 스킵(${symbol}): 포지션 가치가 최소주문금액(${Math.round(
+                      minCost
+                    )}) 미만`
+                  );
+                  _tp1SkipNotified.add(symbol);
+                }
+                await sleep(300);
+                continue;
+              }
+            }
+
+            const adaptive = await tryAdaptiveSell(symbol, sellAmt, lastPx);
+            const r = adaptive.result;
+            if (r.ok && adaptive.sold > 0) {
+              const amountSold = adaptive.sold;
+              pos.size -= amountSold;
               pos.invested = pos.size * lastPx;
               pos.tookTP1 = true;
               if (USE_BEP_AFTER_TP1) pos.entry = Math.min(pos.entry, lastPx);
@@ -1503,7 +1537,7 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               const { gross, fee, net } = pnlBreakdown(
                 refEntry,
                 lastPx,
-                sellAmt
+                amountSold
               );
               realizedToday += net;
               grossToday += gross;
