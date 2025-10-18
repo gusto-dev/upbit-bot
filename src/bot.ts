@@ -166,11 +166,19 @@ const LONG_HOLD_DISABLE_TP_TIGHTEN = bool(
 // 최대 보유기간 초과 시 자동 청산 여부(기본 false), 알림은 항상 전송
 const LONG_HOLD_TIME_EXIT = bool(process.env.LONG_HOLD_TIME_EXIT, false);
 
-// 일일 손실 트레이드 수 초과 시 신규 진입 중단 (0이면 비활성화)
+// 일일 손실 트레이드 수 초과 시 진입 제한 (0이면 비활성화)
+// HALT_MODE=day 인 경우: 하루 종일 신규 진입 중단
+// HALT_MODE=cooldown 인 경우: DAILY_LOSS_COOLDOWN_MIN 분 동안만 신규 진입 중단
 const HALT_AFTER_N_LOSSES = clamp(
   num(process.env.HALT_AFTER_N_LOSSES, 0),
   0,
   100
+);
+const HALT_MODE = (process.env.HALT_MODE || "cooldown") as "day" | "cooldown";
+const DAILY_LOSS_COOLDOWN_MIN = clamp(
+  num(process.env.DAILY_LOSS_COOLDOWN_MIN, 60),
+  1,
+  1440
 );
 const HALT_NOTIFY_ONCE = bool(process.env.HALT_NOTIFY_ONCE, true);
 
@@ -394,6 +402,8 @@ console.log("CONFIG", {
   LONG_HOLD_DISABLE_TP_TIGHTEN,
   LONG_HOLD_TIME_EXIT,
   HALT_AFTER_N_LOSSES,
+  HALT_MODE,
+  DAILY_LOSS_COOLDOWN_MIN,
   HALT_NOTIFY_ONCE,
   USE_FEE_SAFE_BEP,
   DAILY_NET_PROFIT_CAP_PCT,
@@ -446,10 +456,40 @@ function canEnterByLossLimit(): boolean {
 
 // 일일 손실 트레이드 수 기준 추가 게이트
 let dailyLossTrades = 0; // 당일 손실로 마감된 트레이드 수
-let _haltNoticeSentForDay = ""; // KST 날짜 문자열로 중복 알림 방지
+let _haltNoticeSentForDay = ""; // KST 날짜 문자열로 중복 알림 방지 (day 모드)
+let _lossHaltUntil = 0; // cooldown 모드: 매수 중단 해제 시각(utc ms)
+let _lossHaltNotifiedUntil = 0; // 같은 쿨다운 윈도우에 중복 알림 방지
 function canEnterByDailyLossTrades(): boolean {
   if (HALT_AFTER_N_LOSSES <= 0) return true;
-  return dailyLossTrades < HALT_AFTER_N_LOSSES;
+  if (HALT_MODE === "day") {
+    return dailyLossTrades < HALT_AFTER_N_LOSSES;
+  }
+  // cooldown 모드
+  return Date.now() >= _lossHaltUntil;
+}
+
+async function onDailyLossThresholdReached() {
+  const today = todayStrKST();
+  if (HALT_AFTER_N_LOSSES <= 0) return;
+  if (HALT_MODE === "day") {
+    // 하루 종일 중단, 하루 1회만 알림
+    if (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today) {
+      await tg(
+        `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → 금일 신규 진입 중단`
+      );
+      _haltNoticeSentForDay = today;
+    }
+    return;
+  }
+  // cooldown 모드: N분 동안 신규 진입 중단
+  _lossHaltUntil = Date.now() + DAILY_LOSS_COOLDOWN_MIN * 60_000;
+  // 공지는 즉시 1회만 송신하고, 게이트에서도 중복 송신 안 하도록 표시
+  if (_lossHaltNotifiedUntil !== _lossHaltUntil) {
+    await tg(
+      `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → ${DAILY_LOSS_COOLDOWN_MIN}분 매수 쿨다운`
+    );
+    _lossHaltNotifiedUntil = _lossHaltUntil;
+  }
 }
 // 일일 손실금액 한도 초과 알림(하루 1회)
 let _ddNoticeSentForDay = "";
@@ -1432,16 +1472,11 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                   _lastStopAt.set(symbol, Date.now());
                   // 손절로 전량 종료: 손실 트레이드로 계산
                   dailyLossTrades += 1;
-                  const today = todayStrKST();
                   if (
                     HALT_AFTER_N_LOSSES > 0 &&
-                    dailyLossTrades >= HALT_AFTER_N_LOSSES &&
-                    (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today)
+                    dailyLossTrades >= HALT_AFTER_N_LOSSES
                   ) {
-                    await tg(
-                      `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → 금일 신규 진입 중단`
-                    );
-                    _haltNoticeSentForDay = today;
+                    await onDailyLossThresholdReached();
                   }
                   await tg(
                     `❌ 손절: ${symbol} @${Math.round(lastPx)} (${pct.toFixed(
@@ -1585,16 +1620,11 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 else {
                   lossesToday++;
                   dailyLossTrades += 1;
-                  const today = todayStrKST();
                   if (
                     HALT_AFTER_N_LOSSES > 0 &&
-                    dailyLossTrades >= HALT_AFTER_N_LOSSES &&
-                    (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today)
+                    dailyLossTrades >= HALT_AFTER_N_LOSSES
                   ) {
-                    await tg(
-                      `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → 금일 신규 진입 중단`
-                    );
-                    _haltNoticeSentForDay = today;
+                    await onDailyLossThresholdReached();
                   }
                 }
                 await tg(
@@ -1648,16 +1678,11 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                   else {
                     lossesToday++;
                     dailyLossTrades += 1;
-                    const today = todayStrKST();
                     if (
                       HALT_AFTER_N_LOSSES > 0 &&
-                      dailyLossTrades >= HALT_AFTER_N_LOSSES &&
-                      (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today)
+                      dailyLossTrades >= HALT_AFTER_N_LOSSES
                     ) {
-                      await tg(
-                        `⛔ 손실 트레이드 누적 ${dailyLossTrades}회 → 금일 신규 진입 중단`
-                      );
-                      _haltNoticeSentForDay = today;
+                      await onDailyLossThresholdReached();
                     }
                   }
                   await tg(
@@ -1775,12 +1800,24 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
             }
           }
           if (!canEnterByDailyLossTrades()) {
-            const today = todayStrKST();
-            if (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today) {
-              await tg(
-                `⛔ 일일 손실 트레이드 ${HALT_AFTER_N_LOSSES}회 도달: 신규 진입 중단 (금일)`
-              );
-              _haltNoticeSentForDay = today;
+            if (HALT_MODE === "day") {
+              const today = todayStrKST();
+              if (!HALT_NOTIFY_ONCE || _haltNoticeSentForDay !== today) {
+                await tg(
+                  `⛔ 일일 손실 트레이드 ${HALT_AFTER_N_LOSSES}회 도달: 신규 진입 중단 (금일)`
+                );
+                _haltNoticeSentForDay = today;
+              }
+            } else {
+              // cooldown 모드: 남은 시간 안내 (중복 송신 방지)
+              const remainMs = Math.max(0, _lossHaltUntil - Date.now());
+              const min = Math.ceil(remainMs / 60_000);
+              if (_lossHaltNotifiedUntil !== _lossHaltUntil) {
+                await tg(
+                  `⛔ 손실 트레이드 쿨다운 진행중: 약 ${min}분 남음 (임계 ${HALT_AFTER_N_LOSSES}회)`
+                );
+                _lossHaltNotifiedUntil = _lossHaltUntil;
+              }
             }
             maybeDebugEntry(symbol, "daily loss-trades halt");
             await sleep(500);
@@ -2236,6 +2273,8 @@ async function main() {
       realizedToday = 0;
       dailyLossTrades = 0;
       _haltNoticeSentForDay = "";
+      _lossHaltUntil = 0;
+      _lossHaltNotifiedUntil = 0;
       _ddNoticeSentForDay = "";
       _profitCapNoticeSentForDay = "";
     }
