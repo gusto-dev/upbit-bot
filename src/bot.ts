@@ -1470,23 +1470,44 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                   positions.delete(symbol);
                   fullyExited = true;
                   _lastStopAt.set(symbol, Date.now());
-                  // 손절로 전량 종료: 손실 트레이드로 계산
-                  dailyLossTrades += 1;
-                  if (
-                    HALT_AFTER_N_LOSSES > 0 &&
-                    dailyLossTrades >= HALT_AFTER_N_LOSSES
-                  ) {
-                    await onDailyLossThresholdReached();
+                  // 전량 청산 결과에 따라 승/패 및 메시지 구분
+                  const totalNet = pos.runningNet || 0;
+                  if (totalNet < 0) {
+                    lossesToday++;
+                    dailyLossTrades += 1;
+                    if (
+                      HALT_AFTER_N_LOSSES > 0 &&
+                      dailyLossTrades >= HALT_AFTER_N_LOSSES
+                    ) {
+                      await onDailyLossThresholdReached();
+                    }
+                    await tg(
+                      `❌ 손절: ${symbol} @${Math.round(lastPx)} (${pct.toFixed(
+                        2
+                      )}%) sold=${adaptive.sold.toFixed(
+                        6
+                      )} full-exit\n gross=${gross.toFixed(
+                        0
+                      )} fee=${fee.toFixed(0)} net=${net.toFixed(
+                        0
+                      )} cum=${Math.round(realizedToday)}`
+                    );
+                  } else {
+                    winsToday++;
+                    const label =
+                      totalNet > 0 ? "🟢 스톱 청산(이익)" : "⚪ BEP 스톱 청산";
+                    await tg(
+                      `${label}: ${symbol} @${Math.round(
+                        lastPx
+                      )} (${pct.toFixed(2)}%) sold=${adaptive.sold.toFixed(
+                        6
+                      )} full-exit\n gross=${gross.toFixed(
+                        0
+                      )} fee=${fee.toFixed(0)} net=${net.toFixed(
+                        0
+                      )} cum=${Math.round(realizedToday)}`
+                    );
                   }
-                  await tg(
-                    `❌ 손절: ${symbol} @${Math.round(lastPx)} (${pct.toFixed(
-                      2
-                    )}%) sold=${adaptive.sold.toFixed(
-                      6
-                    )} full-exit\n gross=${gross.toFixed(0)} fee=${fee.toFixed(
-                      0
-                    )} net=${net.toFixed(0)} cum=${Math.round(realizedToday)}`
-                  );
                 } else {
                   pos.size = remaining;
                   pos.invested = pos.size * lastPx;
@@ -1495,8 +1516,10 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                   }
                   positions.set(symbol, pos);
                   _lastStopAt.set(symbol, Date.now());
+                  const partLabel =
+                    net < 0 ? "❌ 부분 손절" : "🟡 부분 스톱 청산";
                   await tg(
-                    `❌ 부분 손절: ${symbol} @${Math.round(
+                    `${partLabel}: ${symbol} @${Math.round(
                       lastPx
                     )} 남은=${pos.size.toFixed(6)} sold=${adaptive.sold.toFixed(
                       6
