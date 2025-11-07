@@ -4,6 +4,7 @@ import "dotenv/config";
 import ccxt from "ccxt";
 import { UpbitTickerFeed } from "./lib/wsTicker";
 import { loadState, saveState } from "./lib/persist";
+import { appendTrade, loadStats } from "./lib/analytics";
 // 뉴스 필터 제거됨
 
 // ===================== ENV (Validated) =====================
@@ -192,6 +193,10 @@ const DAILY_PROFIT_NOTIFY_ONCE = bool(
   process.env.DAILY_PROFIT_NOTIFY_ONCE,
   true
 );
+// ===== 분석/로깅 =====
+const ENABLE_ANALYTICS = bool(process.env.ENABLE_ANALYTICS, true);
+const TRADE_LOG_FILE =
+  process.env.TRADE_LOG_FILE || `${process.cwd()}/analytics/trades.log`;
 
 // ===== 추가 사이징/리스크 옵션 =====
 // 고정 1회 진입 금액이 지정되면 POS_PCT 기반 계산을 덮어씀
@@ -408,6 +413,8 @@ console.log("CONFIG", {
   USE_FEE_SAFE_BEP,
   DAILY_NET_PROFIT_CAP_PCT,
   DAILY_PROFIT_NOTIFY_ONCE,
+  ENABLE_ANALYTICS,
+  TRADE_LOG_FILE,
 });
 
 // ===================== TYPES/STATE =====================
@@ -1431,7 +1438,19 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 const fee = FEE_RATE;
                 const bePx =
                   fee < 1 ? pos.entry * ((1 + fee) / (1 - fee)) : pos.entry; // 안전장치
+                const prev = pos.stopPrice;
                 pos.stopPrice = Math.max(pos.stopPrice, bePx);
+                if (ENABLE_ANALYTICS && pos.stopPrice !== prev) {
+                  appendTrade(TRADE_LOG_FILE, {
+                    ts: Date.now(),
+                    day: todayStrKST(),
+                    symbol,
+                    event: "fee_safe_adjust",
+                    exitPrice: pos.stopPrice,
+                    size: pos.size,
+                    longHold: LONG_HOLD_MODE,
+                  });
+                }
               } else {
                 const tighten = pos.entry * 0.002; // 0.2% tighten
                 pos.stopPrice = Math.max(pos.stopPrice, pos.entry + tighten);
@@ -1605,6 +1624,23 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
               pos.runningFee = (pos.runningFee || 0) + fee;
               if (net >= 0) winsToday++;
               else lossesToday++;
+              if (ENABLE_ANALYTICS) {
+                appendTrade(TRADE_LOG_FILE, {
+                  ts: Date.now(),
+                  day: todayStrKST(),
+                  symbol,
+                  event: "tp1",
+                  exitPrice: lastPx,
+                  soldSize: amountSold,
+                  size: pos.size,
+                  gross,
+                  fee,
+                  net,
+                  pnlPct: (lastPx - refEntry) / refEntry,
+                  cumNetAfter: realizedToday,
+                  longHold: LONG_HOLD_MODE,
+                });
+              }
               await tg(
                 `✅ TP1: ${symbol} ${(tp1SellFracActive * 100).toFixed(
                   0
@@ -1650,6 +1686,22 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                     await onDailyLossThresholdReached();
                   }
                 }
+                if (ENABLE_ANALYTICS) {
+                  appendTrade(TRADE_LOG_FILE, {
+                    ts: Date.now(),
+                    day: todayStrKST(),
+                    symbol,
+                    event: "tp2",
+                    exitPrice: lastPx,
+                    soldSize: adaptive.sold,
+                    gross,
+                    fee,
+                    net,
+                    pnlPct: (lastPx - refEntry) / refEntry,
+                    cumNetAfter: realizedToday,
+                    longHold: LONG_HOLD_MODE,
+                  });
+                }
                 await tg(
                   `🎯 TP2: ${symbol} 전량/거의 전량 익절 sold=${adaptive.sold.toFixed(
                     6
@@ -1661,6 +1713,23 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                 pos.size = remaining;
                 pos.invested = pos.size * lastPx;
                 positions.set(symbol, pos);
+                if (ENABLE_ANALYTICS) {
+                  appendTrade(TRADE_LOG_FILE, {
+                    ts: Date.now(),
+                    day: todayStrKST(),
+                    symbol,
+                    event: "tp2_partial",
+                    exitPrice: lastPx,
+                    soldSize: adaptive.sold,
+                    size: remaining,
+                    gross,
+                    fee,
+                    net,
+                    pnlPct: (lastPx - refEntry) / refEntry,
+                    cumNetAfter: realizedToday,
+                    longHold: LONG_HOLD_MODE,
+                  });
+                }
                 await tg(
                   `🎯 TP2 부분: ${symbol} 남은=${remaining.toFixed(
                     6
@@ -1708,6 +1777,22 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                       await onDailyLossThresholdReached();
                     }
                   }
+                  if (ENABLE_ANALYTICS) {
+                    appendTrade(TRADE_LOG_FILE, {
+                      ts: Date.now(),
+                      day: todayStrKST(),
+                      symbol,
+                      event: "trail",
+                      exitPrice: lastPx,
+                      soldSize: adaptive.sold,
+                      gross,
+                      fee,
+                      net,
+                      pnlPct: (lastPx - refEntry) / refEntry,
+                      cumNetAfter: realizedToday,
+                      longHold: LONG_HOLD_MODE,
+                    });
+                  }
                   await tg(
                     `🛑 트레일 스탑: ${symbol} 청산 sold=${adaptive.sold.toFixed(
                       6
@@ -1719,6 +1804,23 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                   pos.size = remaining;
                   pos.invested = pos.size * lastPx;
                   positions.set(symbol, pos);
+                  if (ENABLE_ANALYTICS) {
+                    appendTrade(TRADE_LOG_FILE, {
+                      ts: Date.now(),
+                      day: todayStrKST(),
+                      symbol,
+                      event: "trail_partial",
+                      exitPrice: lastPx,
+                      soldSize: adaptive.sold,
+                      size: remaining,
+                      gross,
+                      fee,
+                      net,
+                      pnlPct: (lastPx - refEntry) / refEntry,
+                      cumNetAfter: realizedToday,
+                      longHold: LONG_HOLD_MODE,
+                    });
+                  }
                   await tg(
                     `🛑 트레일 부분: ${symbol} 남은=${remaining.toFixed(
                       6
@@ -2070,6 +2172,17 @@ async function runner(symbol: string, feed: UpbitTickerFeed) {
                     }, 2500);
                     incTradeCount(symbol);
                     _lastEntryAt.set(symbol, Date.now());
+                    if (ENABLE_ANALYTICS) {
+                      appendTrade(TRADE_LOG_FILE, {
+                        ts: Date.now(),
+                        day: todayStrKST(),
+                        symbol,
+                        event: "open",
+                        entryPrice: lastPx,
+                        size,
+                        longHold: LONG_HOLD_MODE,
+                      });
+                    }
                     await tg(
                       `🟢 진입: ${symbol} @${Math.round(
                         lastPx
@@ -2259,15 +2372,32 @@ async function main() {
         .slice(0, 3)
         .map(([r, c]) => `${r}:${c}`)
         .join(", ");
-      tg(
-        `📊 Daily Summary (${lastSummaryDay})\n gross=${grossToday.toFixed(
-          0
-        )} fee=${feeToday.toFixed(0)} net=${realizedToday.toFixed(
-          0
-        )}\n wins=${winsToday} losses=${lossesToday} winRate=${winRate.toFixed(
-          1
-        )}%\n fails:${topFails || "-"}`
-      );
+      if (ENABLE_ANALYTICS) {
+        const s = loadStats(TRADE_LOG_FILE);
+        tg(
+          `📊 Daily Summary (${lastSummaryDay})\n gross=${grossToday.toFixed(
+            0
+          )} fee=${feeToday.toFixed(0)} net=${realizedToday.toFixed(
+            0
+          )}\n wins=${winsToday} losses=${lossesToday} winRate=${winRate.toFixed(
+            1
+          )}%\n PF=${(s.profitFactor || 0).toFixed(2)} Exp=${(
+            s.expectancy || 0
+          ).toFixed(0)} avgWin=${(s.avgWin || 0).toFixed(0)} avgLoss=${(
+            s.avgLoss || 0
+          ).toFixed(0)}\n fails:${topFails || "-"}`
+        );
+      } else {
+        tg(
+          `📊 Daily Summary (${lastSummaryDay})\n gross=${grossToday.toFixed(
+            0
+          )} fee=${feeToday.toFixed(0)} net=${realizedToday.toFixed(
+            0
+          )}\n wins=${winsToday} losses=${lossesToday} winRate=${winRate.toFixed(
+            1
+          )}%\n fails:${topFails || "-"}`
+        );
+      }
       // 날짜 넘어가기 직전 상태 저장
       try {
         const out: Record<string, Pos> = {};
