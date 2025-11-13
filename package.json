@@ -8,7 +8,11 @@
     "build": "tsc -p .",
     "start": "node --enable-source-maps dist/bot.js",
     "start:dev": "tsx src/bot.ts",
-    "postbuild": "echo skip prune"
+    "postbuild": "echo skip prune",
+    "logs:tail": "node scripts/trades-summary.js --file analytics/trades.log --last 100 && node -e \"console.log('--- tail -f (Ctrl+C to exit) ---')\" && bash scripts/trades-follow.sh analytics/trades.log",
+    "logs:summary": "node scripts/trades-summary.js --file analytics/trades.log",
+    "logs:tail:win": "powershell -ExecutionPolicy Bypass -File scripts/trades-tail.ps1",
+    "logs:summary:win": "powershell -ExecutionPolicy Bypass -File scripts/trades-summary.ps1"
   },
   "keywords": [],
   "author": "",
