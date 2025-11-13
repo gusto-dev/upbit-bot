@@ -11,6 +11,7 @@
     "postbuild": "echo skip prune",
     "logs:tail": "node scripts/trades-summary.js --file analytics/trades.log --last 100 && node -e \"console.log('--- tail -f (Ctrl+C to exit) ---')\" && bash scripts/trades-follow.sh analytics/trades.log",
     "logs:summary": "node scripts/trades-summary.js --file analytics/trades.log",
+    "logs:summary:today": "node scripts/trades-summary-today.js",
     "logs:tail:win": "powershell -ExecutionPolicy Bypass -File scripts/trades-tail.ps1",
     "logs:summary:win": "powershell -ExecutionPolicy Bypass -File scripts/trades-summary.ps1"
   },
